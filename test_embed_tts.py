@@ -16,6 +16,7 @@ nltk.download('punkt')
 import time
 import random
 import yaml
+import re
 from munch import Munch
 import numpy as np
 import torch
@@ -221,128 +222,20 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
 
 
 # synthesize a text
-text = "I wasn’t asking for magic. Just honesty. Just a moment that felt real. " \
-"But you... you gave me maybes, silences, and almosts. And I held on to all of them like they meant something. " \
-"Like you meant something. I loved you with everything I had — and you made it feel like too much." 
+passage = "Oh, for heaven’s sake, stop sniveling! You’re not the only one the world’s punched in the gut! You think those tears are currency? That sorrow makes you special? Wake up! We’re all bleeding behind our smiles, we just don’t broadcast it like a soap opera! I held my grief like a grenade and still showed up every damn day! You want pity? Go find a mirror, it’ll give you all the drama you need. Don’t sit there drowning in a puddle you made, stand up! Misery loves company, sure, but I’m not RSVPing to your breakdown. Pain isn’t a license to collapse; it’s a forge, a fire, burn or be better! So either wipe your face or wallow, but don’t expect me to applaud the latter. I care, but not enough to let you rot." 
 
-
-# # Steps 5 ; Embedding 1
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=1)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 1= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_1.wav", wav, 24000)
-
-# # Steps 200 ; Embedding 1
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=200, embedding_scale=1)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 200 Steps and Embedding 1= {time_taken:5f}")
-# sf.write("embedding/output_200_steps_embedding_1.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 3
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=3)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 3= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_3.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 5
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=5)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 5= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_5.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 2
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=2)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 2= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_2.wav", wav, 24000)
-
-# # Steps 200 ; Embedding 2
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 200 Steps and Embedding 2= {time_taken:5f}")
-# sf.write("embedding/output_200_steps_embedding_2.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 25
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=25)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 25= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_25.wav", wav, 24000)
-
-
-# # Steps 5 ; Embedding 1.5
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=1.5)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 1.5= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_1_5.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
+# Steps 10 ; Embedding 1.5
 start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
+sentences = passage.split('.')
+wavs = []
+s_prev = None
+for text in sentences:
+    if text.strip() == "": continue
+    text += '.' # add it back
+    noise = torch.randn(1,1,256).to(device)
+    print(f"Executing Text {text}")
+    wav, s_prev = LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=10, embedding_scale=1.5)
+    wavs.append(wav)
 time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2A= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2A.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2B= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2B.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2C= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2C.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2D= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2D.wav", wav, 24000)
+print(f"Time Taken for 10 Steps and Embedding 1.5= {time_taken:5f}")
+sf.write("passages/output_10_steps_embedding_1_5.wav", np.concatenate(wavs), 24000)
