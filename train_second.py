@@ -89,7 +89,7 @@ def main(config_path):
     optimizer_params = Munch(config['optimizer_params'])
     
     train_list, val_list = get_data_path_list(train_path, val_path)
-    device = 'cuda'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -220,7 +220,7 @@ def main(config_path):
     iters = 0
     
     criterion = nn.L1Loss() # F0 loss (regression)
-    torch.cuda.empty_cache()
+    torch.device.empty_cache()
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
     
@@ -576,7 +576,7 @@ def main(config_path):
                     batch = [b.to(device) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
                     with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
+                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                         text_mask = length_to_mask(input_lengths).to(texts.device)
 
                         _, _, s2s_attn = model.text_aligner(mels, mask, texts)

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import click
 import warnings
+import traceback
 warnings.simplefilter('ignore')
 
 # load packages
@@ -36,7 +37,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 import logging
 from accelerate.logging import get_logger
-logger = get_logger(__name__, log_level="DEBUG")
+logger = get_logger(__name__, log_level="INFO")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config.yml', type=str)
@@ -47,13 +50,13 @@ def main(config_path):
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs])    
+    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs],device_placement=True)    
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir + "/tensorboard")
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.logger.addHandler(file_handler)
     
@@ -178,12 +181,13 @@ def main(config_path):
         _ = [model[key].train() for key in model]
 
         for i, batch in enumerate(train_dataloader):
+            log_print(f"Starting Batch {i}: Size = {len(batch[0])}", logger)
             waves = batch[0]
             batch = [b.to(device) for b in batch[1:]]
             texts, input_lengths, _, _, mels, mel_input_length, _ = batch
             
             with torch.no_grad():
-                mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
+                mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
             ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
@@ -320,11 +324,15 @@ def main(config_path):
 
                 running_loss = 0
                 
-                print('Time elasped:', time.time()-start_time)
+                #log_print('Time elasped:', time.time()-start_time, logger)
+                log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
+                log_print(f"Ending Batch {i}: Size = {len(batch[0])}", logger)
                                 
         loss_test = 0
 
         _ = [model[key].eval() for key in model]
+
+        log_print("Crossed Epoch Run", logger)
 
         with torch.no_grad():
             iters_test = 0
@@ -336,7 +344,7 @@ def main(config_path):
                 texts, input_lengths, _, _, mels, mel_input_length, _ = batch
 
                 with torch.no_grad():
-                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
+                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                     ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
 
                     s2s_attn = s2s_attn.transpose(-1, -2)
@@ -368,7 +376,7 @@ def main(config_path):
                     en.append(asr[bib, :, random_start:random_start+mel_len])
                     gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                     y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                    wav.append(torch.from_numpy(y).to('cuda'))
+                    wav.append(torch.from_numpy(y).to(device))
 
                 wav = torch.stack(wav).float().detach()
 
@@ -386,9 +394,9 @@ def main(config_path):
                 iters_test += 1
 
         if accelerator.is_main_process:
-            print('Epochs:', epoch + 1)
-            log_print('Validation loss: %.3f' % (loss_test / iters_test) + '\n\n\n\n', logger)
-            print('\n\n\n')
+            log_print(f"Epochs: {epoch + 1}", logger)
+            log_print(f"Validation loss: {loss_test / iters_test:.3f}\n\n\n\n", logger)
+            log_print('\n\n\n', logger)
             writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
             attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
             writer.add_figure('eval/attn', attn_image, epoch)
@@ -416,7 +424,7 @@ def main(config_path):
             if epoch % saving_epoch == 0:
                 if (loss_test / iters_test) < best_loss:
                     best_loss = loss_test / iters_test
-                print('Saving..')
+                log_print('Saving..', logger)
                 state = {
                     'net':  {key: model[key].state_dict() for key in model}, 
                     'optimizer': optimizer.state_dict(),
@@ -428,7 +436,7 @@ def main(config_path):
                 torch.save(state, save_path)
                                 
     if accelerator.is_main_process:
-        print('Saving..')
+        log_print('Saving..', logger)
         state = {
             'net':  {key: model[key].state_dict() for key in model}, 
             'optimizer': optimizer.state_dict(),
@@ -442,4 +450,11 @@ def main(config_path):
         
     
 if __name__=="__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        try:
+            logger.error("Unhandled exception occurred:", exc_info=True)
+        except Exception:
+            log_print("Unhandled exception occurred:")
+            traceback.print_exc()

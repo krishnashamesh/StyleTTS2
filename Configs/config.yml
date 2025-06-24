@@ -2,11 +2,11 @@ log_dir: "Models/LJSpeech"
 first_stage_path: "first_stage.pth"
 save_freq: 2
 log_interval: 10
-device: "cuda"
-epochs_1st: 200 # number of epochs for first stage training (pre-training)
-epochs_2nd: 100 # number of peochs for second stage training (joint training)
-batch_size: 16
-max_len: 400 # maximum number of frames
+device: "cpu"
+epochs_1st: 5 # number of epochs for first stage training (pre-training)
+epochs_2nd: 3 # number of peochs for second stage training (joint training)
+batch_size: 2
+max_len: 100 # maximum number of frames
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
@@ -19,9 +19,9 @@ PLBERT_dir: 'Utils/PLBERT/'
 data_params:
   train_data: "Data/train_list.txt"
   val_data: "Data/val_list.txt"
-  root_path: "/local/LJSpeech-1.1/wavs"
+  root_path: "Data/LJSpeech-1.1/wavs"
   OOD_data: "Data/OOD_texts.txt"
-  min_length: 50 # sample until texts with this size are obtained for OOD texts
+  min_length: 10 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:
   sr: 24000
@@ -97,8 +97,8 @@ loss_params:
     lambda_sty: 1. # style reconstruction loss (2nd stage)
     lambda_diff: 1. # score matching loss (2nd stage)
     
-    diff_epoch: 20 # style diffusion starting epoch (2nd stage)
-    joint_epoch: 50 # joint training starting epoch (2nd stage)
+    diff_epoch: 3 # style diffusion starting epoch (2nd stage)
+    joint_epoch: 4 # joint training starting epoch (2nd stage)
 
 optimizer_params:
   lr: 0.0001 # general learning rate
