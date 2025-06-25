@@ -31,6 +31,9 @@ from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSche
 
 from optimizers import build_optimizer
 
+from torch import nn
+from torch.nn.utils.rnn import PackedSequence
+
 # simple fix for dataparallel that allows access to class attributes
 class MyDataParallel(torch.nn.DataParallel):
     def __getattr__(self, name):
@@ -42,9 +45,9 @@ class MyDataParallel(torch.nn.DataParallel):
 import logging
 from logging import StreamHandler
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 handler = StreamHandler()
-handler.setLevel(logging.DEBUG)
+handler.setLevel(logging.INFO)
 logger.addHandler(handler)
 
 
@@ -60,12 +63,14 @@ def main(config_path):
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
 
     
-    batch_size = config.get('batch_size', 10)
+    log_print(f"Config: {config}", logger)
+
+    batch_size = config.get('batch_size', 10)    
 
     epochs = config.get('epochs_2nd', 200)
     save_freq = config.get('save_freq', 2)
@@ -142,7 +147,7 @@ def main(config_path):
     if not load_pretrained:
         if config.get('first_stage_path', '') != '':
             first_stage_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
-            print('Loading the first stage model at %s ...' % first_stage_path)
+            log_print('Loading the first stage model at %s ...' % first_stage_path, logger)
             model, _, start_epoch, iters = load_checkpoint(model, 
                 None, 
                 first_stage_path,
@@ -220,12 +225,18 @@ def main(config_path):
     iters = 0
     
     criterion = nn.L1Loss() # F0 loss (regression)
-    torch.device.empty_cache()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    import gc
+    gc.collect()
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
     
-    print('BERT', optimizer.optimizers['bert'])
-    print('decoder', optimizer.optimizers['decoder'])
+    log_print(f"BERT: {optimizer.optimizers['bert']}", logger)
+    log_print(f"decoder: {optimizer.optimizers['decoder']}", logger)
+
 
     start_ds = False
     
@@ -302,8 +313,8 @@ def main(config_path):
                 s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                 gs.append(s)
 
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
+            s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
+            gs = torch.stack(gs).squeeze(1) # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
@@ -559,7 +570,7 @@ def main(config_path):
                 
                 running_loss = 0
                 
-                print('Time elasped:', time.time()-start_time)
+                log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
                 
         loss_test = 0
         loss_align = 0
@@ -604,12 +615,27 @@ def main(config_path):
                         s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                         gs.append(s)
 
-                    s = torch.stack(ss).squeeze()
-                    gs = torch.stack(gs).squeeze()
+                    s = torch.stack(ss).squeeze(1)
+                    gs = torch.stack(gs).squeeze(1)
                     s_trg = torch.cat([s, gs], dim=-1).detach()
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+
+                    log_print("Tracing Model Component Shapes:\n", logger)
+                    log_print("Decoder:", logger)
+                    trace_shapes(model.decoder)
+                    log_print("Predictor:", logger)
+                    trace_shapes(model.predictor)
+                    log_print("Style Encoder:", logger)
+                    trace_shapes(model.style_encoder)
+                    log_print("Text Encoder:", logger)
+                    trace_shapes(model.text_encoder)
+                    log_print("Predictor Encoder:", logger)
+                    trace_shapes(model.predictor_encoder)
+                    log_print("Diffusion:", logger)
+                    trace_shapes(model.diffusion)
+
                     d, p = model.predictor(d_en, s, 
                                                         input_lengths, 
                                                         s2s_attn_mono, 
@@ -675,9 +701,9 @@ def main(config_path):
                     traceback.print_exc()
                     continue
 
-        print('Epochs:', epoch + 1)
-        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
-        print('\n\n\n')
+        log_print(f"Epochs: {epoch + 1}", logger)
+        log_print('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n', logger)
+        log_print('\n\n\n', logger)
         writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
         writer.add_scalar('eval/dur_loss', loss_align / iters_test, epoch + 1)
         writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
@@ -770,7 +796,7 @@ def main(config_path):
         if epoch % saving_epoch == 0:
             if (loss_test / iters_test) < best_loss:
                 best_loss = loss_test / iters_test
-            print('Saving..')
+            log_print('Saving..', logger)
             state = {
                 'net':  {key: model[key].state_dict() for key in model}, 
                 'optimizer': optimizer.state_dict(),
@@ -787,6 +813,30 @@ def main(config_path):
                 
                 with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
                     yaml.dump(config, outfile, default_flow_style=True)
+
+def trace_shapes(model, logger=None):
+    def _hook(mod, inp, out):
+        def safe_shape(x):
+            if isinstance(x, torch.Tensor):
+                return tuple(x.shape)
+            elif isinstance(x, PackedSequence):
+                return f"PackedSequence({tuple(x.data.shape)})"
+            else:
+                return type(x).__name__
+
+        cin = [safe_shape(x) for x in inp]
+        cout = safe_shape(out) if isinstance(out, (torch.Tensor, PackedSequence)) else type(out).__name__
+
+        line = f"{mod.__class__.__name__:20s}  {cin} -> {cout}"
+        if logger:
+            log_print(line, logger)
         
+        print(line)
+
+    for m in model.modules():
+        if not isinstance(m, nn.Sequential) and m.__class__.__name__ != 'ModuleList':
+            m.register_forward_hook(_hook)
+
+
 if __name__=="__main__":
     main()

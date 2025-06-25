@@ -90,7 +90,8 @@ model = build_model(recursive_munch(config['model_params']), text_aligner, pitch
 _ = [model[key].eval() for key in model]
 _ = [model[key].to(device) for key in model]
 
-params_whole = torch.load("Models/LJSpeech/epoch_2nd_00100.pth", map_location='cpu')
+# params_whole = torch.load("Models/LJSpeech/epoch_2nd_00100.pth", map_location='cpu')
+params_whole = torch.load("Models/LJSpeech/epoch_2nd_00002.pth", map_location='cpu')
 params = params_whole['net']
 
 for key in model:
@@ -142,6 +143,12 @@ def inference(text, noise, diffusion_steps=5, embedding_scale=1):
         s_pred = sampler(noise,
               embedding=bert_dur[0].unsqueeze(0), num_steps=diffusion_steps,
               embedding_scale=embedding_scale).squeeze(0)
+        
+        # assert torch.isfinite(s_pred).all(), "s_pred blew up"
+
+        if not torch.isfinite(s_pred).all():
+            print("⚠️  diffusion produced NaN/Inf – for s_pred falling back to zeros")
+            s_pred = torch.zeros_like(s_pred)
 
         s = s_pred[:, 128:]
         ref = s_pred[:, :128]
@@ -151,8 +158,16 @@ def inference(text, noise, diffusion_steps=5, embedding_scale=1):
         x, _ = model.predictor.lstm(d)
         duration = model.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(axis=-1)
-        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
 
+        # assert torch.isfinite(duration).all(), "duration has NaNs"
+        
+        if not torch.isfinite(duration).all():
+            print("⚠️  diffusion produced NaN/Inf – for duration falling back to ones")
+        # replace NaNs / Infs with a safe value
+        duration = torch.where(torch.isfinite(duration), duration, torch.ones_like(duration))
+
+        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+        
         pred_dur[-1] += 5
 
         pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
@@ -191,6 +206,11 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
       s_pred = sampler(noise,
             embedding=bert_dur[0].unsqueeze(0), num_steps=diffusion_steps,
             embedding_scale=embedding_scale).squeeze(0)
+    
+      if not torch.isfinite(s_pred).all():
+        print("⚠️  diffusion produced NaN/Inf – for s_pred falling back to zeros")
+        s_pred = torch.zeros_like(s_pred)
+
 
       if s_prev is not None:
           # convex combination of previous and current style
@@ -204,6 +224,12 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
       x, _ = model.predictor.lstm(d)
       duration = model.predictor.duration_proj(x)
       duration = torch.sigmoid(duration).sum(axis=-1)
+
+      if not torch.isfinite(duration).all():
+        print("⚠️  diffusion produced NaN/Inf – for duration falling back to ones")
+        # replace NaNs / Infs with a safe value
+        duration = torch.where(torch.isfinite(duration), duration, torch.ones_like(duration))
+      
       pred_dur = torch.round(duration.squeeze()).clamp(min=1)
 
       pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
@@ -222,9 +248,9 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
 
 
 # synthesize a text
-passage = "Oh, for heaven’s sake, stop sniveling! You’re not the only one the world’s punched in the gut! You think those tears are currency? That sorrow makes you special? Wake up! We’re all bleeding behind our smiles, we just don’t broadcast it like a soap opera! I held my grief like a grenade and still showed up every damn day! You want pity? Go find a mirror, it’ll give you all the drama you need. Don’t sit there drowning in a puddle you made, stand up! Misery loves company, sure, but I’m not RSVPing to your breakdown. Pain isn’t a license to collapse; it’s a forge, a fire, burn or be better! So either wipe your face or wallow, but don’t expect me to applaud the latter. I care, but not enough to let you rot." 
+passage = "He left, and the silence screamed louder than his goodbye." 
 
-# Steps 10 ; Embedding 1.5
+# Steps 10 ; Embedding 1
 start = time.time()
 sentences = passage.split('.')
 wavs = []
@@ -234,8 +260,8 @@ for text in sentences:
     text += '.' # add it back
     noise = torch.randn(1,1,256).to(device)
     print(f"Executing Text {text}")
-    wav, s_prev = LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=10, embedding_scale=1.5)
+    wav, s_prev = LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=10, embedding_scale=1)
     wavs.append(wav)
 time_taken = (time.time() - start)
-print(f"Time Taken for 10 Steps and Embedding 1.5= {time_taken:5f}")
-sf.write("passages/output_10_steps_embedding_1_5.wav", np.concatenate(wavs), 24000)
+print(f"Time Taken for 10 Steps and Embedding 1= {time_taken:5f}")
+sf.write("passages/output_10_steps_embedding_1.wav", np.concatenate(wavs), 24000)
