@@ -35,7 +35,8 @@ from accelerate import DistributedDataParallelKwargs
 
 from torch.utils.tensorboard import SummaryWriter
 
-import logging
+import atexit, faulthandler, signal, sys, os, time, threading, subprocess, logging
+
 from accelerate.logging import get_logger
 logger = get_logger(__name__, log_level="INFO")
 
@@ -47,6 +48,13 @@ def main(config_path):
     config = yaml.safe_load(open(config_path))
 
     log_dir = config['log_dir']
+    
+    _redirect_io(log_dir)
+    _print_last_oom()
+
+    _start_logger_auto_flush(logger.logger)
+    _install_signal_handlers(logger.logger)
+
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -326,13 +334,13 @@ def main(config_path):
                 
                 #log_print('Time elasped:', time.time()-start_time, logger)
                 log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
-                log_print(f"Ending Batch {i}: Size = {len(batch[0])}", logger)
+                # log_print(f"Ending Batch {i}: Size = {len(batch[0])}", logger)
                                 
         loss_test = 0
 
         _ = [model[key].eval() for key in model]
 
-        log_print("Crossed Epoch Run", logger)
+        # log_print("Crossed Epoch Run", logger)
 
         with torch.no_grad():
             iters_test = 0
@@ -448,7 +456,59 @@ def main(config_path):
         torch.save(state, save_path)
 
         
-    
+
+# ------------------------------------------------------------------
+# 1.  Redirect everything to log_dir/train_stdout.log
+# ------------------------------------------------------------------
+def _redirect_io(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, 'train_stdout.log')
+    log_file = open(log_path, 'a', buffering=1)  # line-buffered
+    sys.stdout = log_file
+    sys.stderr = log_file
+    faulthandler.enable(file=log_file)           # C-level faults
+    print(f'\n\n=== New run @ {time.ctime()} ===', flush=True)
+
+
+# ------------------------------------------------------------------
+# 2.  Flush python logging every second
+# ------------------------------------------------------------------
+def _start_logger_auto_flush(logger, interval=1.0):
+    def _flusher():
+        while True:
+            for h in logger.handlers:
+                h.flush()
+            time.sleep(interval)
+    t = threading.Thread(target=_flusher, daemon=True)
+    t.start()
+
+
+# ------------------------------------------------------------------
+# 3.  Save note on SIGTERM/SIGINT
+# ------------------------------------------------------------------
+def _install_signal_handlers(logger):
+    def _handler(signum, frame):
+        logger.error(f'Received signal {signum} – shutting down.')
+        for h in logger.handlers:
+            h.flush()
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT,  _handler)
+
+
+# ------------------------------------------------------------------
+# 4.  At next start, show last OOM killer message (if any)
+# ------------------------------------------------------------------
+def _print_last_oom():
+    try:
+        dmesg = subprocess.check_output(['dmesg', '-T', '-l', 'err,crit,alert,emerg']).decode()
+        lines = [l for l in dmesg.strip().split('\n') if 'Out of memory' in l or 'Killed process' in l]
+        if lines:
+            print('=== Possible OOM detected from previous run ===')
+            print(lines[-1])
+    except Exception:
+        pass
+
 if __name__=="__main__":
     try:
         main()

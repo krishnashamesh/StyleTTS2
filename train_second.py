@@ -22,6 +22,8 @@ from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
 from Utils.PLBERT.util import load_plbert
 
+import atexit, faulthandler, signal, sys, os, time, threading, subprocess, logging
+
 from models import *
 from losses import *
 from utils import *
@@ -33,6 +35,7 @@ from optimizers import build_optimizer
 
 from torch import nn
 from torch.nn.utils.rnn import PackedSequence
+
 
 # simple fix for dataparallel that allows access to class attributes
 class MyDataParallel(torch.nn.DataParallel):
@@ -51,6 +54,46 @@ handler.setLevel(logging.INFO)
 logger.addHandler(handler)
 
 
+import os, psutil, time, torch
+from datetime import timedelta
+
+def log_metrics(phase: str, step: int, total: int,
+                metrics: dict,
+                logger, writer=None, global_step=None,
+                batch_time=None, mem_gb=None, lr=None):
+    """
+    Pretty-prints and (optionally) TensorBoards a metrics dict.
+
+    phase   : "train" | "val"
+    step    : current mini-batch idx  (1-based)
+    total   : total mini-batches in epoch
+    metrics : {"mel": 0.52, "dur": 1.4, ...}
+    """
+    core = " | ".join(f"{k}:{v:.3f}" for k, v in metrics.items())
+    extras = []
+    if batch_time is not None:
+        extras.append(f"time:{timedelta(seconds=batch_time)}")
+    if mem_gb is not None:
+        extras.append(f"mem:{mem_gb:.1f} GB")
+    if lr is not None:
+        extras.append(f"lr:{lr:.2e}")
+    msg = f"{phase.capitalize()} [{step}/{total}] {core}"
+    if extras:
+        msg += " | " + " ".join(extras)
+    logger.info(msg)
+
+    if writer is not None and global_step is not None:
+        for k, v in metrics.items():
+            writer.add_scalar(f"{phase}/{k}", v, global_step)
+
+
+def current_mem_gb():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_reserved() / 1e9
+    # fall back to resident set size on CPU
+    return psutil.Process(os.getpid()).memory_info().rss / 1e9
+
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config.yml', type=str)
 def main(config_path):
@@ -58,6 +101,13 @@ def main(config_path):
     
     log_dir = config['log_dir']
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
+
+    _redirect_io(log_dir)
+    _print_last_oom()
+
+    _start_logger_auto_flush(logger)
+    _install_signal_handlers(logger)
+
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     writer = SummaryWriter(log_dir + "/tensorboard")
 
@@ -68,7 +118,7 @@ def main(config_path):
     logger.addHandler(file_handler)
 
     
-    log_print(f"Config: {config}", logger)
+    # log_print(f"Config: {config}", logger)
 
     batch_size = config.get('batch_size', 10)    
 
@@ -234,8 +284,8 @@ def main(config_path):
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
     
-    log_print(f"BERT: {optimizer.optimizers['bert']}", logger)
-    log_print(f"decoder: {optimizer.optimizers['decoder']}", logger)
+    # log_print(f"BERT: {optimizer.optimizers['bert']}", logger)
+    # log_print(f"decoder: {optimizer.optimizers['decoder']}", logger)
 
 
     start_ds = False
@@ -551,26 +601,59 @@ def main(config_path):
                 
             iters = iters + 1
             
-            if (i+1)%log_interval == 0:
-                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
-                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm))
+            # if (i+1)%log_interval == 0:
+            #     log_print('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
+            #         %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm), logger)
                 
-                writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
-                writer.add_scalar('train/gen_loss', loss_gen_all, iters)
-                writer.add_scalar('train/d_loss', d_loss, iters)
-                writer.add_scalar('train/ce_loss', loss_ce, iters)
-                writer.add_scalar('train/dur_loss', loss_dur, iters)
-                writer.add_scalar('train/slm_loss', loss_lm, iters)
-                writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
-                writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
-                writer.add_scalar('train/sty_loss', loss_sty, iters)
-                writer.add_scalar('train/diff_loss', loss_diff, iters)
-                writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
-                writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
+            #     writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
+            #     writer.add_scalar('train/gen_loss', loss_gen_all, iters)
+            #     writer.add_scalar('train/d_loss', d_loss, iters)
+            #     writer.add_scalar('train/ce_loss', loss_ce, iters)
+            #     writer.add_scalar('train/dur_loss', loss_dur, iters)
+            #     writer.add_scalar('train/slm_loss', loss_lm, iters)
+            #     writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
+            #     writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
+            #     writer.add_scalar('train/sty_loss', loss_sty, iters)
+            #     writer.add_scalar('train/diff_loss', loss_diff, iters)
+            #     writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
+            #     writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
                 
-                running_loss = 0
-                
-                log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
+            #     running_loss = 0
+
+            #     log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
+
+            # ─ inside the main train loop ─
+            if (i + 1) % log_interval == 0:
+                batch_time = time.time() - start_time
+                lr_now = optimizer.optimizers['decoder'].param_groups[0]['lr']
+                log_metrics(
+                    phase='train',
+                    step=i + 1,
+                    total=len(train_list) // batch_size,
+                    metrics={
+                        'mel': running_loss / log_interval,
+                        'disc': d_loss.item(),
+                        'dur':  loss_dur.item(),
+                        'ce':   loss_ce.item(),
+                        'norm': loss_norm_rec.item(),
+                        'F0':   loss_F0_rec.item(),
+                        'lm':   loss_lm.item(),
+                        'gen':  loss_gen_all.item(),
+                        'sty':  loss_sty.item(),
+                        'diff': loss_diff.item(),
+                        'discLM': d_loss_slm.item(),
+                        'genLM': loss_gen_lm.item()
+                    },
+                    logger=logger,
+                    writer=writer,
+                    global_step=iters,
+                    batch_time=batch_time,
+                    mem_gb=current_mem_gb(),
+                    lr=lr_now
+                )
+                running_loss = 0.
+                start_time = time.time()          # reset timer
+
                 
         loss_test = 0
         loss_align = 0
@@ -579,6 +662,7 @@ def main(config_path):
 
         with torch.no_grad():
             iters_test = 0
+            val_start = time.time()
             for batch_idx, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
                 
@@ -622,19 +706,19 @@ def main(config_path):
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-                    log_print("Tracing Model Component Shapes:\n", logger)
-                    log_print("Decoder:", logger)
-                    trace_shapes(model.decoder)
-                    log_print("Predictor:", logger)
-                    trace_shapes(model.predictor)
-                    log_print("Style Encoder:", logger)
-                    trace_shapes(model.style_encoder)
-                    log_print("Text Encoder:", logger)
-                    trace_shapes(model.text_encoder)
-                    log_print("Predictor Encoder:", logger)
-                    trace_shapes(model.predictor_encoder)
-                    log_print("Diffusion:", logger)
-                    trace_shapes(model.diffusion)
+                    # log_print("Tracing Model Component Shapes:\n", logger)
+                    # log_print("Decoder:", logger)
+                    # trace_shapes(model.decoder)
+                    # log_print("Predictor:", logger)
+                    # trace_shapes(model.predictor)
+                    # log_print("Style Encoder:", logger)
+                    # trace_shapes(model.style_encoder)
+                    # log_print("Text Encoder:", logger)
+                    # trace_shapes(model.text_encoder)
+                    # log_print("Predictor Encoder:", logger)
+                    # trace_shapes(model.predictor_encoder)
+                    # log_print("Diffusion:", logger)
+                    # trace_shapes(model.diffusion)
 
                     d, p = model.predictor(d_en, s, 
                                                         input_lengths, 
@@ -696,6 +780,24 @@ def main(config_path):
                     loss_f += (loss_F0).mean()
 
                     iters_test += 1
+
+                                    
+                    if batch_idx % 1 == 0:
+                        log_metrics(
+                            phase='val',
+                            step=batch_idx,
+                            total=len(val_dataloader),
+                            metrics={
+                                'mel': (loss_test / max(1, batch_idx + 1)).item(),
+                                'dur': (loss_align / max(1, batch_idx + 1)).item(),
+                                'F0':  (loss_f     / max(1, batch_idx + 1)).item()
+                            },
+                            logger=logger,
+                            batch_time=time.time() - val_start,
+                            mem_gb=current_mem_gb()
+                        )
+                        val_start = time.time()
+
                 except Exception as e:
                     print(f"run into exception", e)
                     traceback.print_exc()
@@ -836,6 +938,60 @@ def trace_shapes(model, logger=None):
     for m in model.modules():
         if not isinstance(m, nn.Sequential) and m.__class__.__name__ != 'ModuleList':
             m.register_forward_hook(_hook)
+
+        
+
+# ------------------------------------------------------------------
+# 1.  Redirect everything to log_dir/train_stdout.log
+# ------------------------------------------------------------------
+def _redirect_io(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, 'train_stdout.log')
+    log_file = open(log_path, 'a', buffering=1)  # line-buffered
+    sys.stdout = log_file
+    sys.stderr = log_file
+    faulthandler.enable(file=log_file)           # C-level faults
+    print(f'\n\n=== New run @ {time.ctime()} ===', flush=True)
+
+
+# ------------------------------------------------------------------
+# 2.  Flush python logging every second
+# ------------------------------------------------------------------
+def _start_logger_auto_flush(logger, interval=1.0):
+    def _flusher():
+        while True:
+            for h in logger.handlers:
+                h.flush()
+            time.sleep(interval)
+    t = threading.Thread(target=_flusher, daemon=True)
+    t.start()
+
+
+# ------------------------------------------------------------------
+# 3.  Save note on SIGTERM/SIGINT
+# ------------------------------------------------------------------
+def _install_signal_handlers(logger):
+    def _handler(signum, frame):
+        logger.error(f'Received signal {signum} – shutting down.')
+        for h in logger.handlers:
+            h.flush()
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT,  _handler)
+
+
+# ------------------------------------------------------------------
+# 4.  At next start, show last OOM killer message (if any)
+# ------------------------------------------------------------------
+def _print_last_oom():
+    try:
+        dmesg = subprocess.check_output(['dmesg', '-T', '-l', 'err,crit,alert,emerg']).decode()
+        lines = [l for l in dmesg.strip().split('\n') if 'Out of memory' in l or 'Killed process' in l]
+        if lines:
+            print('=== Possible OOM detected from previous run ===')
+            print(lines[-1])
+    except Exception:
+        pass
 
 
 if __name__=="__main__":
