@@ -11,6 +11,7 @@ np.random.seed(0)
 
 import nltk
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 # load packages
 import time
@@ -32,6 +33,8 @@ from utils import *
 from text_utils import TextCleaner
 textclenaer = TextCleaner()
 
+out_dir = "embedding"
+os.makedirs(out_dir, exist_ok=True)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
