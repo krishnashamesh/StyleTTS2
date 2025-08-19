@@ -15,4 +15,6 @@ tqdm
 typing
 typing-extensions
 phonemizer
+pandas
+tensorboard
 git+https://github.com/resemble-ai/monotonic_align.git

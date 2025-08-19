@@ -1,12 +1,12 @@
 log_dir: "Models/LJSpeech"
 first_stage_path: "first_stage.pth"
-save_freq: 2
-log_interval: 10
-device: "cpu"
+save_freq: 1
+log_interval: 250
+device: "cuda"
 epochs_1st: 5 # number of epochs for first stage training (pre-training)
 epochs_2nd: 3 # number of peochs for second stage training (joint training)
 batch_size: 2
-max_len: 100 # maximum number of frames
+max_len: 800 # maximum number of frames
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters

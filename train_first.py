@@ -49,11 +49,11 @@ def main(config_path):
 
     log_dir = config['log_dir']
     
-    _redirect_io(log_dir)
-    _print_last_oom()
+    #_redirect_io(log_dir)
+    #_print_last_oom()
 
-    _start_logger_auto_flush(logger.logger)
-    _install_signal_handlers(logger.logger)
+    #_start_logger_auto_flush(logger.logger)
+    #_install_signal_handlers(logger.logger)
 
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
@@ -189,7 +189,7 @@ def main(config_path):
         _ = [model[key].train() for key in model]
 
         for i, batch in enumerate(train_dataloader):
-            log_print(f"Starting Batch {i}: Size = {len(batch[0])}", logger)
+            #log_print(f"Starting Batch {i}: Size = {len(batch[0])}", logger)
             waves = batch[0]
             batch = [b.to(device) for b in batch[1:]]
             texts, input_lengths, _, _, mels, mel_input_length, _ = batch
@@ -400,6 +400,8 @@ def main(config_path):
 
                 loss_test += accelerator.gather(loss_mel).mean().item()
                 iters_test += 1
+
+        log_print(f"Time elapsed in the overall Epoch: {time.time() - start_time:.2f} seconds", logger)
 
         if accelerator.is_main_process:
             log_print(f"Epochs: {epoch + 1}", logger)
