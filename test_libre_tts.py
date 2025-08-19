@@ -35,6 +35,9 @@ textcleaner = TextCleaner()
 
 import soundfile as sf
 
+out_dir = "libre_output"
+os.makedirs(out_dir, exist_ok=True)
+
 
 to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
@@ -354,15 +357,15 @@ text = "The sun’s out, my heart’s louder than the birds. Everything feels po
 
 reference_dicts = {}
 #reference_dicts['696_92939'] = "Demo/reference_audio/696_92939_000016_000006.wav"
-reference_dicts['1789_142896'] = "Demo/reference_audio/1789_142896_000022_000005.wav"
+#reference_dicts['1789_142896'] = "Demo/reference_audio/1789_142896_000022_000005.wav"
 
-# reference_dir = "Demo/reference_audio"
-# reference_dicts = {}
+reference_dir = "Demo/reference_audio"
+reference_dicts = {}
 
-# for filename in os.listdir(reference_dir):
-#     if filename.endswith(".wav") and not filename.startswith('.'):
-#         key = filename.split('.')[0]  # removes extension
-#         reference_dicts[key] = os.path.join(reference_dir, filename)
+for filename in os.listdir(reference_dir):
+    if filename.endswith(".wav") and not filename.startswith('.'):
+        key = filename.split('.')[0]  # removes extension
+        reference_dicts[key] = os.path.join(reference_dir, filename)
 
 
 noise = torch.randn(1,1,256).to(device)
