@@ -1,5 +1,7 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64")
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+os.environ.setdefault("D_UPDATE_EVERY", "2")
 
 import os.path as osp
 import re
@@ -38,6 +40,12 @@ from accelerate import DistributedDataParallelKwargs
 
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    from torch.backends.cuda import sdp_kernel
+    sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
+except Exception:
+    pass
+
 import atexit, faulthandler, signal, sys, os, time, threading, subprocess, logging
 
 import gc
@@ -67,11 +75,22 @@ def main(config_path):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     
     #Turn on mixed precision + TF32
-    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],device_placement=True, gradient_accumulation_steps=6, mixed_precision="bf16")    
+    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],device_placement=True, gradient_accumulation_steps=8, mixed_precision="bf16")    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
+
+    # ---- Tunables via env (sane speed-leaning defaults) ----
+    D_UPDATE_EVERY   = int(os.getenv("D_UPDATE_EVERY", "2"))  # update D every N G updates
+    SLM_UPDATE_EVERY = int(os.getenv("SLM_UPDATE_EVERY", "2"))  # compute WavLM loss every N G updates
+    # Style cap ramp
+    STYLE_CAP_FINAL  = int(os.getenv("STYLE_CAP_FINAL",  "160"))
+    STYLE_CAP_WARM   = int(os.getenv("STYLE_CAP_WARM",   "96"))
+    TMA_RAMP_EPOCHS  = int(os.getenv("TMA_RAMP_EPOCHS",  "2"))
+    # Curriculum warmup (fraction of total epochs) and start factor
+    CURRIC_WARM_FRAC = float(os.getenv("CURRIC_WARM_FRAC", "0.10"))
+    CURRIC_START     = float(os.getenv("CURRIC_START",     "0.90"))
     
     
     if accelerator.is_main_process:
@@ -204,7 +223,8 @@ def main(config_path):
     # initialize optimizers after preparing models for compatibility with FSDP
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                   scheduler_params_dict= {key: scheduler_params.copy() for key in model},
-                               lr=float(config['optimizer_params'].get('lr', 1e-4)))
+                               lr=float(config['optimizer_params'].get('lr', 1e-4)),
+                               impl=str(config.get('optimizer_params', {}).get('impl', os.environ.get('OPTIM_IMPL', 'torch'))))
     
     for k, v in optimizer.optimizers.items():
         optimizer.optimizers[k] = accelerator.prepare(optimizer.optimizers[k])
@@ -298,12 +318,15 @@ def main(config_path):
             base_mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), effective_max_len // 2])
             base_mel_len_st = int(mel_input_length.min().item() / 2 - 1)
 
-            cf = curriculum_factor(epoch, warmup_epochs=math.ceil(epochs*0.2), start=0.8, end=1.0)
+            # Faster curriculum by default; env-overridable
+            cf = curriculum_factor(
+                epoch,
+                warmup_epochs=math.ceil(epochs * CURRIC_WARM_FRAC),
+                start=CURRIC_START,
+                end=1.0
+            )
 
             # Style window cap + gentle ramp after TMA starts
-            STYLE_CAP_FINAL = 160
-            STYLE_CAP_WARM  = 96
-            TMA_RAMP_EPOCHS = 2
             if epoch < TMA_epoch:
                 style_cap = STYLE_CAP_WARM
             else:
@@ -374,19 +397,22 @@ def main(config_path):
             
             y_rec = model.decoder(en, F0_real, real_norm, s)
             
-            # discriminator loss
-            
+            # ---------- Discriminator loss (gated cadence) ----------
+            d_loss_val = 0.0
             with accelerator.accumulate(model["mpd"]):  # any model key works
-                if epoch >= TMA_epoch:
-                    d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
-                    accelerator.backward(d_loss / acc_steps)
-
-                    if accelerator.sync_gradients:      # only at accumulation boundary
+                if epoch >= TMA_epoch and accelerator.sync_gradients:
+                    # Only update D every Nth accumulation boundary
+                    do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
+                    if do_d_update:
+                        d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
+                        accelerator.backward(d_loss / acc_steps)
+                        # step both discriminators
                         optimizer.step('msd')
                         optimizer.step('mpd')
-                        # do NOT zero here if you can't zero only D; we’ll zero once after G
-                else:
-                    d_loss = 0
+                        d_loss_val = float(d_loss.detach().item())
+                    # Note: grads are cleared globally below with optimizer.zero_grad(...)
+                # else: skip D forward/back entirely for real compute savings
+
 
             with accelerator.accumulate(model["decoder"]):
                 # no zero_grad here; we’re accumulating
@@ -400,7 +426,15 @@ def main(config_path):
 
                     loss_mono    = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
                     loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                    loss_slm     = wl(wav.detach(), y_rec).mean()
+                    # Intermittent WavLM feature loss to save compute
+                    if SLM_UPDATE_EVERY <= 1:
+                        loss_slm = wl(wav.detach(), y_rec).mean()
+                    else:
+                        use_slm = ((iters // acc_steps) % SLM_UPDATE_EVERY) == 0
+                        if use_slm:
+                            loss_slm = wl(wav.detach(), y_rec).mean()
+                        else:
+                            loss_slm = torch.as_tensor(0.0, device=device)
 
                     g_loss = (
                         loss_params.lambda_mel  * loss_mel +
@@ -421,22 +455,52 @@ def main(config_path):
                 accelerator.backward(g_loss / acc_steps)
 
                 if accelerator.sync_gradients:  # only step/zero at the accumulation boundary
-                    optimizer.step('text_encoder')
-                    optimizer.step('style_encoder')
-                    optimizer.step('decoder')
-                    if epoch >= TMA_epoch:
-                        optimizer.step('text_aligner')
-                        optimizer.step('pitch_extractor')
+                    def _clip_and_check(name, max_norm=1.0):
+                        torch.nn.utils.clip_grad_norm_(model[name].parameters(),
+                                                       max_norm, error_if_nonfinite=False, foreach=False)
+                        for p in model[name].parameters():
+                            g = getattr(p, "grad", None)
+                            if g is not None and not torch.isfinite(g).all():
+                                # zero-out bad grads so they can't reach the optimizer
+                                p.grad = None
+                                return False
+                        return True
 
-                    optimizer.zero_grad(set_to_none=True)  # now clear ALL grads once
+                    # safe step wrapper (skip-on-error, keep training alive)
+                    def _safe_step(name):
+                        try:
+                            optimizer.step(name)
+                            return True
+                        except Exception as e:
+                            if accelerator.is_main_process:
+                                log_print(f"[step-skip] {name}: {type(e).__name__}: {e}", logger)
+                            # clear grads for this module so we don't accumulate garbage
+                            for p in model[name].parameters():
+                                if getattr(p, "grad", None) is not None:
+                                    p.grad = None
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            return False
+
+                    # Text/Style/Decoder
+                    if _clip_and_check('text_encoder'):   _safe_step('text_encoder')
+                    if _clip_and_check('style_encoder'):  _safe_step('style_encoder')
+                    if _clip_and_check('decoder'):        _safe_step('decoder')
+                    # Post-TMA modules
+                    if epoch >= TMA_epoch:
+                        if _clip_and_check('text_aligner'):    _safe_step('text_aligner')
+                        if _clip_and_check('pitch_extractor'): _safe_step('pitch_extractor')
+
+                    optimizer.zero_grad(set_to_none=True)
 
                     # EMA only when we actually stepped
                     ema["text_encoder"].update()
                     ema["style_encoder"].update()
                     ema["decoder"].update()
-
-
-            
+          
+            d_loss = d_loss_val
             iters = iters + 1
             
             if (i+1)%log_interval == 0 and accelerator.is_main_process:

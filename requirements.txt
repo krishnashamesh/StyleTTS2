@@ -17,4 +17,5 @@ typing-extensions
 phonemizer
 pandas
 tensorboard
+bitsandbytes
 git+https://github.com/resemble-ai/monotonic_align.git

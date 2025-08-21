@@ -104,6 +104,9 @@ optimizer_params:
   lr: 0.0001 # general learning rate
   bert_lr: 0.00001 # learning rate for PLBERT
   ft_lr: 0.00001 # learning rate for acoustic modules
+  # impl: torch          # baseline PyTorch AdamW (current)
+  # impl: bnb8bit      # A) 8-bit AdamW on GPU
+  impl: bnb_paged8   # B) Paged 8-bit AdamW (offload-ish)
   
 slmadv_params:
   min_len: 400 # minimum length of samples

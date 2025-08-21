@@ -13,6 +13,7 @@ from torch import nn
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
+from collections import OrderedDict
 
 from collections import defaultdict
 
@@ -103,6 +104,12 @@ class FilePathDataset(torch.utils.data.Dataset):
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
         self.max_mel_length = 192
+
+        # Per-process LRU cache for decoded waves (uses host RAM)
+        self._cache = OrderedDict()
+        # Tune via env var; this is a count of wave entries (not MB)
+        # With N workers, total cached entries ≈ N * DATASET_CACHE_CAP
+        self._cache_cap = int(os.environ.get("DATASET_CACHE_CAP", "4096"))
         
         self.min_length = min_length
         with open(OOD_data, 'r', encoding='utf-8') as f:
@@ -111,6 +118,28 @@ class FilePathDataset(torch.utils.data.Dataset):
         self.ptexts = [t.split('|')[idx] for t in tl]
         
         self.root_path = root_path
+
+    def _get_wave(self, wave_path_full):
+        """LRU-cached wave loader (mono @ 24kHz)."""
+        if wave_path_full in self._cache:
+            x = self._cache.pop(wave_path_full)   # move to MRU
+            self._cache[wave_path_full] = x
+            return x
+        wave, sr = sf.read(wave_path_full)
+        if wave.ndim == 2 and wave.shape[-1] == 2:
+            wave = wave[:, 0]
+        if sr != 24000:
+            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
+        # pad to allow crops near edges (matches original behavior)
+        wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
+        # LRU insert
+        try:
+            self._cache[wave_path_full] = wave
+            if len(self._cache) > self._cache_cap:
+                self._cache.popitem(last=False)   # evict LRU
+        except Exception:
+            pass
+        return wave
 
     def __len__(self):
         return len(self.data_list)
@@ -153,14 +182,8 @@ class FilePathDataset(torch.utils.data.Dataset):
     def _load_tensor(self, data):
         wave_path, text, speaker_id = data
         speaker_id = int(speaker_id)
-        wave, sr = sf.read(osp.join(self.root_path, wave_path))
-        if wave.shape[-1] == 2:
-            wave = wave[:, 0].squeeze()
-        if sr != 24000:
-            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
-            print(wave_path, sr)
-            
-        wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
+        wave_path_full = osp.join(self.root_path, wave_path)
+        wave = self._get_wave(wave_path_full)
         
         text = self.text_cleaner(text)
         
@@ -260,6 +283,15 @@ def build_dataloader(path_list,
                      collate_config={},
                      dataset_config={}):
     
+    def _worker_init_fn(_):
+        try:
+            import torch, os
+            torch.set_num_threads(1)
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
+        except Exception:
+            pass    
+
     dataset = FilePathDataset(path_list, root_path, OOD_data=OOD_data, min_length=min_length, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
 
@@ -279,6 +311,7 @@ def build_dataloader(path_list,
                              pin_memory_device=pin_memory_device if use_pin else '',
                              persistent_workers=persistent_workers,
                              prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+                             worker_init_fn=_worker_init_fn,
                              timeout=timeout,)
 
     return data_loader

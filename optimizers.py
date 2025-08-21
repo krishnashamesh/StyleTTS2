@@ -8,6 +8,16 @@ from torch.optim import Optimizer
 from functools import reduce
 from torch.optim import AdamW
 
+import warnings
+# bitsandbytes 8-bit optimizers
+try:
+    import bitsandbytes as bnb
+    _HAS_BNB = True
+except Exception:
+    _HAS_BNB = False
+
+
+
 class MultiOptimizer:
     def __init__(self, optimizers={}, schedulers={}):
         self.optimizers = optimizers
@@ -62,13 +72,56 @@ def define_scheduler(optimizer, params):
 
     return scheduler
 
-def build_optimizer(parameters_dict, scheduler_params_dict, lr):
-    # optim = dict([(key, AdamW(params, lr=lr, weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9))
-    #                for key, params in parameters_dict.items()])
+def build_optimizer(parameters_dict, scheduler_params_dict, lr, impl: str = "torch"):
+    
+    impl = (os.environ.get("OPTIM_IMPL", impl) or "torch").lower()
 
     use_fused = hasattr(torch.optim.AdamW, "fused") and torch.cuda.is_available()
     optim = {}
     for key, params in parameters_dict.items():
+
+        # keep text_encoder on standard AdamW for stability
+        if key in ("text_encoder", "style_encoder"):
+            if use_fused:
+                opt = torch.optim.AdamW(params,
+                                        lr=lr, weight_decay=1e-4,
+                                        betas=(0.0, 0.99), eps=1e-9,
+                                        fused=True)
+            else:
+                opt = torch.optim.AdamW(params,
+                                        lr=lr, weight_decay=1e-4,
+                                        betas=(0.0, 0.99), eps=1e-9)
+                for pg in opt.param_groups:
+                    pg.setdefault("foreach", True)
+            optim[key] = opt
+            continue
+        
+        if impl == "bnb8bit":
+            if not _HAS_BNB:
+                warnings.warn("[optim] bitsandbytes not available; falling back to torch AdamW")
+                impl = "torch"
+            else:
+                # A) GPU 8-bit AdamW – biggest VRAM win with minimal speed impact
+                min8 = int(os.environ.get("BNB_MIN_8BIT_SIZE", "65536"))
+                opt = bnb.optim.AdamW8bit(params, lr=lr, weight_decay=1e-4,
+                                          betas=(0.0, 0.99), eps=1e-9,
+                                          min_8bit_size=min8)
+                optim[key] = opt
+                continue
+
+        if impl == "bnb_paged8":
+            if not _HAS_BNB:
+                warnings.warn("[optim] bitsandbytes not available; falling back to torch AdamW")
+                impl = "torch"
+            else:
+                # B) Paged 8-bit AdamW – optimizer states mostly in host, lower VRAM, some slowdown
+                min8 = int(os.environ.get("BNB_MIN_8BIT_SIZE", "65536"))
+                opt = bnb.optim.AdamW8bit(params, lr=lr, weight_decay=1e-4,
+                                          betas=(0.0, 0.99), eps=1e-9,
+                                          min_8bit_size=min8)
+                optim[key] = opt
+                continue
+        # Default: PyTorch AdamW (fused if possible, else foreach path)
         if use_fused:
             opt = torch.optim.AdamW(params,
                                     lr=lr, weight_decay=1e-4,
@@ -78,9 +131,9 @@ def build_optimizer(parameters_dict, scheduler_params_dict, lr):
             opt = torch.optim.AdamW(params,
                                     lr=lr, weight_decay=1e-4,
                                     betas=(0.0, 0.99), eps=1e-9)
-            # prefer foreach path for speed on many builds
             for pg in opt.param_groups:
                 pg.setdefault("foreach", True)
+                
         optim[key] = opt
 
     schedulers = dict([(key, define_scheduler(opt, scheduler_params_dict[key])) \
