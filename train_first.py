@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64")
+
 import os.path as osp
 import re
 import sys
@@ -28,6 +30,7 @@ from utils import *
 from losses import *
 from optimizers import build_optimizer
 import time
+import math
 
 from accelerate import Accelerator
 from accelerate.utils import LoggerType
@@ -36,6 +39,10 @@ from accelerate import DistributedDataParallelKwargs
 from torch.utils.tensorboard import SummaryWriter
 
 import atexit, faulthandler, signal, sys, os, time, threading, subprocess, logging
+
+import gc
+import json
+from collections import Counter
 
 from accelerate.logging import get_logger
 logger = get_logger(__name__, log_level="INFO")
@@ -49,16 +56,24 @@ def main(config_path):
 
     log_dir = config['log_dir']
     
-    #_redirect_io(log_dir)
-    #_print_last_oom()
+    _redirect_io(log_dir)
+    _print_last_oom()
 
-    #_start_logger_auto_flush(logger.logger)
-    #_install_signal_handlers(logger.logger)
+    _start_logger_auto_flush(logger.logger)
+    _install_signal_handlers(logger.logger)
 
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs],device_placement=True)    
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    
+    #Turn on mixed precision + TF32
+    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],device_placement=True, gradient_accumulation_steps=6, mixed_precision="bf16")    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    
+    
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir + "/tensorboard")
 
@@ -89,13 +104,18 @@ def main(config_path):
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
 
+    #Performance improvement
+    nw = min(16, os.cpu_count())
+
     train_dataloader = build_dataloader(train_list,
                                         root_path,
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=nw,
                                         dataset_config={},
+                                        prefetch_factor=6,
+                                        persistent_workers=True,
                                         device=device)
 
     val_dataloader = build_dataloader(val_list,
@@ -104,8 +124,10 @@ def main(config_path):
                                       min_length=min_length,
                                       batch_size=batch_size,
                                       validation=True,
-                                      num_workers=0,
+                                      num_workers=nw,
                                       device=device,
+                                      prefetch_factor=6,
+                                      persistent_workers=True,
                                       dataset_config={})
     
     with accelerator.main_process_first():
@@ -135,6 +157,7 @@ def main(config_path):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
 
     best_loss = float('inf')  # best test loss
+    last_val_avg = float('nan')
     loss_train_record = list([])
     loss_test_record = list([])
 
@@ -149,6 +172,34 @@ def main(config_path):
     )
     
     _ = [model[key].to(device) for key in model]
+
+    class EMA:
+        def __init__(self, module, decay=0.999):
+            self.decay = decay
+            self.m = module
+            self.shadow = {k: p.detach().clone().float() for k,p in self.m.state_dict().items()}
+            self.backup = None
+        @torch.no_grad()
+        def update(self):
+            for k, p in self.m.state_dict().items():
+                self.shadow[k].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+        @torch.no_grad()
+        def apply_to(self):
+            self.backup = {k: p.detach().clone() for k,p in self.m.state_dict().items()}
+            self.m.load_state_dict(self.shadow, strict=False)
+        @torch.no_grad()
+        def restore(self):
+            self.m.load_state_dict(self.backup, strict=False)
+            self.backup = None
+
+    def _unwrap(m):
+        return m.module if hasattr(m, "module") else m
+
+    ema = {
+        "decoder":       EMA(_unwrap(model["decoder"]),       decay=0.999),
+        "text_encoder":  EMA(_unwrap(model["text_encoder"]),  decay=0.999),
+        "style_encoder": EMA(_unwrap(model["style_encoder"]), decay=0.999),
+    }
 
     # initialize optimizers after preparing models for compatibility with FSDP
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
@@ -183,22 +234,34 @@ def main(config_path):
                    model_params.slm.sr).to(device)
 
     for epoch in range(start_epoch, epochs):
+        # metrics: reset peak memory and init per-epoch bucket counters
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        mel_bucket_counts = Counter()
+        style_bucket_counts = Counter()
+
         running_loss = 0
         start_time = time.time()
+
+        acc_steps = accelerator.gradient_accumulation_steps
 
         _ = [model[key].train() for key in model]
 
         for i, batch in enumerate(train_dataloader):
             #log_print(f"Starting Batch {i}: Size = {len(batch[0])}", logger)
             waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
+            batch = [b.to(device, non_blocking=True) for b in batch[1:]]
             texts, input_lengths, _, _, mels, mel_input_length, _ = batch
             
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
-            ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+            if epoch < TMA_epoch:
+                with torch.no_grad():
+                    ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+            else:
+                ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
 
             s2s_attn = s2s_attn.transpose(-1, -2)
             s2s_attn = s2s_attn[..., 1:]
@@ -225,34 +288,79 @@ def main(config_path):
                 asr = (t_en @ s2s_attn_mono)
     
             # get clips
-            mel_input_length_all = accelerator.gather(mel_input_length) # for balanced load
-            mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), max_len // 2])
-            mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-        
+
+            mel_input_length_all = (
+                mel_input_length if accelerator.num_processes == 1
+                else accelerator.gather(mel_input_length)
+            )
+
+            effective_max_len = 160 if (epoch < TMA_epoch + 2) else max_len
+            base_mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), effective_max_len // 2])
+            base_mel_len_st = int(mel_input_length.min().item() / 2 - 1)
+
+            cf = curriculum_factor(epoch, warmup_epochs=math.ceil(epochs*0.2), start=0.8, end=1.0)
+
+            # Style window cap + gentle ramp after TMA starts
+            STYLE_CAP_FINAL = 160
+            STYLE_CAP_WARM  = 96
+            TMA_RAMP_EPOCHS = 2
+            if epoch < TMA_epoch:
+                style_cap = STYLE_CAP_WARM
+            else:
+                ramp_alpha = min(1.0, (epoch - TMA_epoch + 1) / TMA_RAMP_EPOCHS)
+                style_cap = int(STYLE_CAP_WARM + (STYLE_CAP_FINAL - STYLE_CAP_WARM) * ramp_alpha)
+
+            # Decide target half-frame lengths (no forced minimums to avoid overshoot on short clips)
+            target_half    = int(base_mel_len    * cf)
+            target_half_st = int(base_mel_len_st * cf)
+            if target_half < 2 or target_half_st < 2:
+                # Batch too short for the requested windows — skip cheaply
+                logger.info(f"[skip] tiny windows: target_half={target_half}, target_half_st={target_half_st}, base={base_mel_len}/{base_mel_len_st}, cf={cf:.3f}")
+                continue
+            # Floor-bucket WITHOUT rounding up
+            mel_len    = _bucket_half_len_floor(target_half)
+            mel_len_st = min(_bucket_half_len_floor(target_half_st), style_cap)
+            
+            # metrics: record bucketed lengths in FULL frames (mel_len values are half-frames)
+            try:
+                mel_full   = int(mel_len * 2)
+                style_full = int(mel_len_st * 2)
+                # If you already bucket upstream, these are already bucketed; we still snap to canonical bins for clean stats
+                mel_b   = _nearest_bucket_full_frames(mel_full)
+                style_b = _nearest_bucket_full_frames(style_full)
+                mel_bucket_counts[mel_b]   += 1
+                style_bucket_counts[style_b] += 1
+            except Exception:
+                pass
+
             en = []
             gt = []
             wav = []
             st = []
+            wav_cpu = []
             
             for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item() / 2)
 
+                mel_length = int(mel_input_length[bib].item() / 2)  # available half-frames
+                # With floor-bucket and min-half calculation above, this is guaranteed > 0
                 random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start:random_start+mel_len])
-                gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
+                en.append(asr[bib, :, random_start:random_start + mel_len])
+                gt.append(mels[bib, :, (random_start * 2):((random_start + mel_len) * 2)])
 
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                wav.append(torch.from_numpy(y).to(device))
+                y = waves[bib][(random_start * 2) * 300:((random_start + mel_len) * 2) * 300]
+
+                wav_cpu.append(torch.from_numpy(y))
                 
                 # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
+                random_start  = np.random.randint(0, mel_length - mel_len_st)
+                st.append(mels[bib, :, (random_start * 2):((random_start + mel_len_st) * 2)])
+
 
             en = torch.stack(en)
             gt = torch.stack(gt).detach()
             st = torch.stack(st).detach()
 
-            wav = torch.stack(wav).float().detach()
+            wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
 
             # clip too short to be used by the style encoder
             if gt.shape[-1] < 80:
@@ -268,54 +376,66 @@ def main(config_path):
             
             # discriminator loss
             
-            if epoch >= TMA_epoch:
-                optimizer.zero_grad()
-                d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
-                accelerator.backward(d_loss)
-                optimizer.step('msd')
-                optimizer.step('mpd')
-            else:
-                d_loss = 0
+            with accelerator.accumulate(model["mpd"]):  # any model key works
+                if epoch >= TMA_epoch:
+                    d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
+                    accelerator.backward(d_loss / acc_steps)
 
-            # generator loss
-            optimizer.zero_grad()
-            loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
-            
-            if epoch >= TMA_epoch: # start TMA training
-                loss_s2s = 0
-                for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
-                    loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
-                loss_s2s /= texts.size(0)
+                    if accelerator.sync_gradients:      # only at accumulation boundary
+                        optimizer.step('msd')
+                        optimizer.step('mpd')
+                        # do NOT zero here if you can't zero only D; we’ll zero once after G
+                else:
+                    d_loss = 0
 
-                loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
-                    
-                loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                loss_slm = wl(wav.detach(), y_rec).mean()
-                
-                g_loss = loss_params.lambda_mel * loss_mel + \
-                loss_params.lambda_mono * loss_mono + \
-                loss_params.lambda_s2s * loss_s2s + \
-                loss_params.lambda_gen * loss_gen_all + \
-                loss_params.lambda_slm * loss_slm
+            with accelerator.accumulate(model["decoder"]):
+                # no zero_grad here; we’re accumulating
+                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
 
-            else:
-                loss_s2s = 0
-                loss_mono = 0
-                loss_gen_all = 0
-                loss_slm = 0
-                g_loss = loss_mel
-            
-            running_loss += accelerator.gather(loss_mel).mean().item()
+                if epoch >= TMA_epoch:  # start TMA training
+                    loss_s2s = 0
+                    for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
+                        loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
+                    loss_s2s /= texts.size(0)
 
-            accelerator.backward(g_loss)
-            
-            optimizer.step('text_encoder')
-            optimizer.step('style_encoder')
-            optimizer.step('decoder')
-            
-            if epoch >= TMA_epoch: 
-                optimizer.step('text_aligner')
-                optimizer.step('pitch_extractor')
+                    loss_mono    = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
+                    loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
+                    loss_slm     = wl(wav.detach(), y_rec).mean()
+
+                    g_loss = (
+                        loss_params.lambda_mel  * loss_mel +
+                        loss_params.lambda_mono * loss_mono +
+                        loss_params.lambda_s2s  * loss_s2s +
+                        loss_params.lambda_gen  * loss_gen_all +
+                        loss_params.lambda_slm  * loss_slm
+                    )
+                else:
+                    loss_s2s = 0
+                    loss_mono = 0
+                    loss_gen_all = 0
+                    loss_slm = 0
+                    g_loss = loss_mel
+
+                running_loss += accelerator.gather(loss_mel).mean().item()
+
+                accelerator.backward(g_loss / acc_steps)
+
+                if accelerator.sync_gradients:  # only step/zero at the accumulation boundary
+                    optimizer.step('text_encoder')
+                    optimizer.step('style_encoder')
+                    optimizer.step('decoder')
+                    if epoch >= TMA_epoch:
+                        optimizer.step('text_aligner')
+                        optimizer.step('pitch_extractor')
+
+                    optimizer.zero_grad(set_to_none=True)  # now clear ALL grads once
+
+                    # EMA only when we actually stepped
+                    ema["text_encoder"].update()
+                    ema["style_encoder"].update()
+                    ema["decoder"].update()
+
+
             
             iters = iters + 1
             
@@ -342,13 +462,16 @@ def main(config_path):
 
         # log_print("Crossed Epoch Run", logger)
 
+        effective_max_len = 160 if (epoch < TMA_epoch + 2) else max_len
+
+        for _k in ema: ema[_k].apply_to()
         with torch.no_grad():
             iters_test = 0
             for batch_idx, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
                 waves = batch[0]
-                batch = [b.to(device) for b in batch[1:]]
+                batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                 texts, input_lengths, _, _, mels, mel_input_length, _ = batch
 
                 with torch.no_grad():
@@ -371,43 +494,96 @@ def main(config_path):
                 asr = (t_en @ s2s_attn)
 
                 # get clips
-                mel_input_length_all = accelerator.gather(mel_input_length) # for balanced load
-                mel_len = min([int(mel_input_length.min().item() / 2 - 1), max_len // 2])
+
+                mel_input_length_all = (
+                    mel_input_length if accelerator.num_processes == 1
+                    else accelerator.gather(mel_input_length)
+                )
+                
+                # Mirror training: safe max derived from batch min length and warmup cap
+                base_mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), effective_max_len // 2])
+
+
+                cf = curriculum_factor(epoch, warmup_epochs=math.ceil(epochs*0.3333), start=0.6, end=1.0) 
+
+                # Use the same floor-bucketing to keep shapes consistent and allocator happy
+                mel_len    = max(40, _bucket_half_len_floor(int(base_mel_len * cf)))
                 
                 en = []
                 gt = []
                 wav = []
+
+                #Batch the wave transfers (avoid per-item .to(device))
+                wav_cpu = []
+
                 for bib in range(len(mel_input_length)):
                     mel_length = int(mel_input_length[bib].item() / 2)
-
+                    # With floor-bucket and min-half calculation, randint high is guaranteed > 0
                     random_start = np.random.randint(0, mel_length - mel_len)
-                    en.append(asr[bib, :, random_start:random_start+mel_len])
-                    gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                    y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                    wav.append(torch.from_numpy(y).to(device))
+                    en.append(asr[bib, :, random_start:random_start + mel_len])
+                    gt.append(mels[bib, :, (random_start * 2):((random_start + mel_len) * 2)])
+                    y = waves[bib][(random_start * 2) * 300:((random_start + mel_len) * 2) * 300]
 
-                wav = torch.stack(wav).float().detach()
+                    wav_cpu.append(torch.from_numpy(y))
+
+                wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
 
                 en = torch.stack(en)
                 gt = torch.stack(gt).detach()
 
+                # --- Validation guards: too-short or too-silent windows ---
+                # Too-short (frames) for downstream modules
+                if gt.shape[-1] < 80:
+                    continue
+                # Too-silent: STFT spectral convergence can NaN when target norm ~ 0.
+                # 1-second window at 24kHz -> this catches flat/silent crops.
+                # Cheap RMS check per item; skip batch if any is silent.
+                rms = wav.float().pow(2).mean(dim=1).sqrt()
+                if (rms < 5e-5).any():
+                    # Optional: uncomment to log once per batch
+                    if accelerator.is_main_process:
+                        log_print("[val] silent batch; skipping", logger)
+                    continue
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                 s = model.style_encoder(gt.unsqueeze(1))
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
+
+                # Optional numeric guard (cheap, avoids rare NaNs from upstream components)
+                F0_real  = torch.nan_to_num(F0_real, nan=0.0, posinf=0.0, neginf=0.0)
+                real_norm = torch.nan_to_num(real_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
                 y_rec = model.decoder(en, F0_real, real_norm, s)
 
-                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                if not torch.isfinite(y_rec).all():
+                    if accelerator.is_main_process:
+                        log_print("[val] non-finite model output; skipping batch", logger)
+                    continue
 
-                loss_test += accelerator.gather(loss_mel).mean().item()
+                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                # Skip non-finite losses to avoid poisoning the epoch average
+                loss_mel_g = accelerator.gather(loss_mel).mean()
+                if not torch.isfinite(loss_mel_g):
+                    if accelerator.is_main_process:
+                        log_print("[val] non-finite loss encountered; skipping batch", logger)
+                    continue
+                loss_test += loss_mel_g.item()
                 iters_test += 1
 
+        #restore training weights
+        for _k in ema: ema[_k].restore()
         log_print(f"Time elapsed in the overall Epoch: {time.time() - start_time:.2f} seconds", logger)
+        
 
         if accelerator.is_main_process:
             log_print(f"Epochs: {epoch + 1}", logger)
-            log_print(f"Validation loss: {loss_test / iters_test:.3f}\n\n\n\n", logger)
+            val_avg = (loss_test / iters_test) if iters_test > 0 else float('nan')
+            last_val_avg = val_avg
+            log_print(f"Validation loss: {val_avg:.3f}\n\n\n\n", logger)
             log_print('\n\n\n', logger)
-            writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
+
+            if iters_test > 0:
+                writer.add_scalar('eval/mel_loss', val_avg, epoch + 1)
+
             attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
             writer.add_figure('eval/attn', attn_image, epoch)
             
@@ -432,18 +608,34 @@ def main(config_path):
                         break
 
             if epoch % saving_epoch == 0:
-                if (loss_test / iters_test) < best_loss:
-                    best_loss = loss_test / iters_test
+                if iters_test > 0 and (val_avg < best_loss):
+                    best_loss = val_avg
                 log_print('Saving..', logger)
                 state = {
                     'net':  {key: model[key].state_dict() for key in model}, 
                     'optimizer': optimizer.state_dict(),
                     'iters': iters,
-                    'val_loss': loss_test / iters_test,
+                    'val_loss': val_avg,
                     'epoch': epoch,
                 }
                 save_path = osp.join(log_dir, 'epoch_1st_%05d.pth' % epoch)
                 torch.save(state, save_path)
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+
+                try:
+                    max_alloc_mb = (torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+                    max_resv_mb  = (torch.cuda.max_memory_reserved()  / (1024**2)) if torch.cuda.is_available() else 0.0
+                    logger.info(f"[mem] epoch={epoch} max_alloc={max_alloc_mb:.1f} MiB max_reserved={max_resv_mb:.1f} MiB")
+                    top_mel = sorted(mel_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+                    top_sty = sorted(style_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+                    logger.info(f"[buckets] mel_top={top_mel} style_top={top_sty}")
+                    dist_path = osp.join(log_dir, f"epoch_{epoch:05d}_buckets.json")
+                    with open(dist_path, "w") as f:
+                        json.dump({"mel": dict(mel_bucket_counts), "style": dict(style_bucket_counts)}, f, indent=2)
+                except Exception as _e:
+                    logger.warning(f"bucket/memory logging failed: {_e}")
                                 
     if accelerator.is_main_process:
         log_print('Saving..', logger)
@@ -451,11 +643,14 @@ def main(config_path):
             'net':  {key: model[key].state_dict() for key in model}, 
             'optimizer': optimizer.state_dict(),
             'iters': iters,
-            'val_loss': loss_test / iters_test,
+            'val_loss': last_val_avg,
             'epoch': epoch,
         }
         save_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
         torch.save(state, save_path)
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         
 
@@ -510,6 +705,34 @@ def _print_last_oom():
             print(lines[-1])
     except Exception:
         pass
+
+def curriculum_factor(epoch, warmup_epochs=2, start=0.6, end=1.0):
+    if epoch >= warmup_epochs:
+        return end
+    alpha = (epoch + 1) / warmup_epochs
+    return start + (end - start) * alpha
+
+BUCKETS = [192,224,256,288,320,352,384,416,448,480]
+def _bucket_half_len_floor(x_half: int) -> int:
+    """
+    Floor-bucket in HALF-frames without ever rounding UP.
+    If the target is below the smallest bucket, just return the target.
+    """
+    full = int(x_half * 2)
+    if full <= 2:
+        return 1
+    # Below smallest bucket → do not bucket (avoid overshoot)
+    if full < BUCKETS[0]:
+        return full // 2
+    for b in reversed(BUCKETS):
+        if b <= full:
+            return b // 2  # return in half-frames
+    return BUCKETS[0] // 2
+
+def _nearest_bucket_full_frames(full_frames: int) -> int:
+    # Clamp and snap to nearest canonical length (frames)
+    full_frames = max(64, min(BUCKETS[-1], int(full_frames)))
+    return min(BUCKETS, key=lambda b: abs(b - full_frames))
 
 if __name__=="__main__":
     try:

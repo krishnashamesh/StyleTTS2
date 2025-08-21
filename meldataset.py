@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
+from collections import defaultdict
+
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -86,6 +88,16 @@ class FilePathDataset(torch.utils.data.Dataset):
 
         self.df = pd.DataFrame(self.data_list)
 
+        # Pre-group items by speaker for fast random ref sampling (avoids per-item pandas.sample)
+        self.by_spk = defaultdict(list)
+        for p, t, s in self.data_list:
+            try:
+                sid = int(s)
+            except Exception:
+                try: sid = int(str(s).strip())
+                except Exception: sid = 0
+            self.by_spk[sid].append((p, t, sid))
+
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
 
         self.mean, self.std = -4, 4
@@ -116,8 +128,11 @@ class FilePathDataset(torch.utils.data.Dataset):
         acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
         
         # get reference sample
-        ref_data = (self.df[self.df[2] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
-        ref_mel_tensor, ref_label = self._load_data(ref_data[:3])
+        # Fast ref sample from pre-built speaker index
+        spk = int(speaker_id) if not isinstance(speaker_id, int) else speaker_id
+        pool = self.by_spk.get(spk) or [(path, data[1], spk)]
+        ref_p, ref_t, _ = random.choice(pool)
+        ref_mel_tensor, ref_label = self._load_data((ref_p, ref_t, spk))
         
         # get OOD text
         
@@ -229,7 +244,7 @@ class Collater(object):
         return waves, texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels
 
 
-
+#Add support for persistent workers
 def build_dataloader(path_list,
                      root_path,
                      validation=False,
@@ -238,18 +253,33 @@ def build_dataloader(path_list,
                      batch_size=4,
                      num_workers=1,
                      device='cpu',
+                     prefetch_factor=4,
+                     persistent_workers=None,
+                     timeout=0,
+                     pin_memory_device=None,
                      collate_config={},
                      dataset_config={}):
     
     dataset = FilePathDataset(path_list, root_path, OOD_data=OOD_data, min_length=min_length, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
+
+    use_pin = (device != 'cpu')
+    if pin_memory_device is None and use_pin:
+        pin_memory_device = 'cuda'
+    if persistent_workers is None:
+        persistent_workers = (num_workers > 0 and not validation)
+
     data_loader = DataLoader(dataset,
                              batch_size=batch_size,
                              shuffle=(not validation),
                              num_workers=num_workers,
                              drop_last=(not validation),
                              collate_fn=collate_fn,
-                             pin_memory=(device != 'cpu'))
+                             pin_memory=use_pin,
+                             pin_memory_device=pin_memory_device if use_pin else '',
+                             persistent_workers=persistent_workers,
+                             prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+                             timeout=timeout,)
 
     return data_loader
 

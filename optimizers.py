@@ -38,11 +38,11 @@ class MultiOptimizer:
         else:
             self.optimizers[key].step()
 
-    def zero_grad(self, key=None):
+    def zero_grad(self, key=None, set_to_none=True):
         if key is not None:
-            self.optimizers[key].zero_grad()
+            self.optimizers[key].zero_grad(set_to_none=set_to_none)
         else:
-            _ = [self.optimizers[key].zero_grad() for key in self.keys]
+            _ = [self.optimizers[key].zero_grad(set_to_none=set_to_none) for key in self.keys]
 
     def scheduler(self, *args, key=None):
         if key is not None:
@@ -63,8 +63,25 @@ def define_scheduler(optimizer, params):
     return scheduler
 
 def build_optimizer(parameters_dict, scheduler_params_dict, lr):
-    optim = dict([(key, AdamW(params, lr=lr, weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9))
-                   for key, params in parameters_dict.items()])
+    # optim = dict([(key, AdamW(params, lr=lr, weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9))
+    #                for key, params in parameters_dict.items()])
+
+    use_fused = hasattr(torch.optim.AdamW, "fused") and torch.cuda.is_available()
+    optim = {}
+    for key, params in parameters_dict.items():
+        if use_fused:
+            opt = torch.optim.AdamW(params,
+                                    lr=lr, weight_decay=1e-4,
+                                    betas=(0.0, 0.99), eps=1e-9,
+                                    fused=True)
+        else:
+            opt = torch.optim.AdamW(params,
+                                    lr=lr, weight_decay=1e-4,
+                                    betas=(0.0, 0.99), eps=1e-9)
+            # prefer foreach path for speed on many builds
+            for pg in opt.param_groups:
+                pg.setdefault("foreach", True)
+        optim[key] = opt
 
     schedulers = dict([(key, define_scheduler(opt, scheduler_params_dict[key])) \
                        for key, opt in optim.items()])
