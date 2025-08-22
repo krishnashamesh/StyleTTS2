@@ -77,6 +77,7 @@ class FilePathDataset(torch.utils.data.Dataset):
                  validation=False,
                  OOD_data="Data/OOD_texts.txt",
                  min_length=50,
+                 mel_cache_dir=None,
                  ):
 
         spect_params = SPECT_PARAMS
@@ -86,6 +87,7 @@ class FilePathDataset(torch.utils.data.Dataset):
         self.data_list = [data if len(data) == 3 else (*data, 0) for data in _data_list]
         self.text_cleaner = TextCleaner()
         self.sr = sr
+        self.mel_cache_dir = mel_cache_dir
 
         self.df = pd.DataFrame(self.data_list)
 
@@ -150,7 +152,8 @@ class FilePathDataset(torch.utils.data.Dataset):
         
         wave, text_tensor, speaker_id = self._load_tensor(data)
         
-        mel_tensor = preprocess(wave).squeeze()
+        # try cache first; fall back to on-the-fly compute
+        mel_tensor = self._load_or_make_mel(path, wave).squeeze()
         
         acoustic_feature = mel_tensor.squeeze()
         length_feature = acoustic_feature.size(1)
@@ -195,8 +198,10 @@ class FilePathDataset(torch.utils.data.Dataset):
         return wave, text, speaker_id
 
     def _load_data(self, data):
+
+        wave_path, text, speaker_id = data
         wave, text_tensor, speaker_id = self._load_tensor(data)
-        mel_tensor = preprocess(wave).squeeze()
+        mel_tensor = self._load_or_make_mel(wave_path, wave).squeeze()
 
         mel_length = mel_tensor.size(1)
         if mel_length > self.max_mel_length:
@@ -204,6 +209,26 @@ class FilePathDataset(torch.utils.data.Dataset):
             mel_tensor = mel_tensor[:, random_start:random_start + self.max_mel_length]
 
         return mel_tensor, speaker_id
+    
+    def _load_or_make_mel(self, rel_path, wave):
+        """
+        If mel_cache_dir is set, load <mel_cache_dir>/<rel_path>.pt (or .npy).
+        Otherwise compute inline using preprocess(wave).
+        """
+        if self.mel_cache_dir:
+            try:
+                tgt = osp.splitext(osp.join(self.mel_cache_dir, rel_path))[0]
+                pt_path = tgt + ".pt"
+                if osp.exists(pt_path):
+                    return torch.load(pt_path, map_location="cpu").float()
+                npy_path = tgt + ".npy"
+                if osp.exists(npy_path):
+                    arr = np.load(npy_path)
+                    return torch.from_numpy(arr).float()
+            except Exception as e:
+                # fall through to compute
+                pass
+        return preprocess(wave).float()
 
 
 class Collater(object):

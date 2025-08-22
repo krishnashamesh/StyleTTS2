@@ -1,15 +1,17 @@
 log_dir: "Models/LJSpeech"
 first_stage_path: "first_stage.pth"
-save_freq: 1
+save_freq: 10
 log_interval: 10
 device: "cuda"
 epochs_1st: 5 # number of epochs for first stage training (pre-training)
-epochs_2nd: 3 # number of epeochs for second stage training (joint training)
-batch_size: 4
+epochs_2nd: 2 # number of epeochs for second stage training (joint training)
+batch_size: 3
+grad_accum: 4
 max_len: 1000 # maximum number of frames
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
+decoder_channels_last: true
 
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"
@@ -21,6 +23,7 @@ data_params:
   val_data: "Data/val_list.txt"
   root_path: "Data/LJSpeech-1.1/wavs"
   OOD_data: "Data/OOD_texts.txt"
+  mel_cache_dir: "Data/mel_cache"
   min_length: 10 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:
@@ -88,7 +91,7 @@ loss_params:
     
     lambda_mono: 1. # monotonic alignment loss (1st stage, TMA)
     lambda_s2s: 1. # sequence-to-sequence loss (1st stage, TMA)
-    TMA_epoch: 3 # TMA starting epoch (1st stage)
+    TMA_epoch: 2 # TMA starting epoch (1st stage)
 
     lambda_F0: 1. # F0 reconstruction loss (2nd stage)
     lambda_norm: 1. # norm reconstruction loss (2nd stage)

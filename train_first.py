@@ -73,9 +73,13 @@ def main(config_path):
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+
+    batch_size = config.get('batch_size', 10)
+    grad_accum = config.get('grad_accum', 4)
     
     #Turn on mixed precision + TF32
-    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],device_placement=True, gradient_accumulation_steps=8, mixed_precision="bf16")    
+    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],
+                    device_placement=True, gradient_accumulation_steps=grad_accum, mixed_precision="bf16")    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -102,7 +106,7 @@ def main(config_path):
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.logger.addHandler(file_handler)
     
-    batch_size = config.get('batch_size', 10)
+
     device = accelerator.device
     
     epochs = config.get('epochs_1st', 200)
@@ -117,6 +121,8 @@ def main(config_path):
     root_path = data_params['root_path']
     min_length = data_params['min_length']
     OOD_data = data_params['OOD_data']
+    mel_cache_dir = data_params.get('mel_cache_dir')
+    ds_cfg = {"mel_cache_dir": mel_cache_dir} if mel_cache_dir else {}
     
     max_len = config.get('max_len', 200)
     
@@ -124,7 +130,7 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     #Performance improvement
-    nw = min(16, os.cpu_count())
+    nw = min(30, os.cpu_count())
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -132,8 +138,8 @@ def main(config_path):
                                         min_length=min_length,
                                         batch_size=batch_size,
                                         num_workers=nw,
-                                        dataset_config={},
-                                        prefetch_factor=6,
+                                        dataset_config=ds_cfg,
+                                        prefetch_factor=8,
                                         persistent_workers=True,
                                         device=device)
 
@@ -145,9 +151,9 @@ def main(config_path):
                                       validation=True,
                                       num_workers=nw,
                                       device=device,
-                                      prefetch_factor=6,
+                                      prefetch_factor=8,
                                       persistent_workers=True,
-                                      dataset_config={})
+                                      dataset_config=ds_cfg)
     
     with accelerator.main_process_first():
         # load pretrained ASR model
@@ -174,6 +180,17 @@ def main(config_path):
     model_params = recursive_munch(config['model_params'])
     multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+    # channels_last on decoder (before accelerator.prepare)
+    CL_FLAG = bool(config.get("decoder_channels_last", False))
+    log_print(f"[init] decoder_channels_last={CL_FLAG}", logger)
+    if CL_FLAG:
+        try:
+            dec = getattr(model["decoder"], "module", model["decoder"])
+            dec.to(memory_format=torch.channels_last)
+            log_print("[channels_last] applied to decoder", logger)
+        except Exception as e:
+            if accelerator.is_main_process:
+                log_print(f"[warn] channels_last not applied: {e}", logger)
 
     best_loss = float('inf')  # best test loss
     last_val_avg = float('nan')
@@ -192,6 +209,20 @@ def main(config_path):
     
     _ = [model[key].to(device) for key in model]
 
+    # After wrapping, confirm decoder memory format
+    try:
+        dec_wrapped = getattr(model["decoder"], "module", model["decoder"])
+        p0 = next(dec_wrapped.parameters())
+        is_cl = p0.is_contiguous(memory_format=torch.channels_last)
+        log_print(f"[channels_last] decoder_contiguous={is_cl}", logger)
+    except Exception:
+        pass
+
+    # Print discriminator cadence & accumulation once
+    if accelerator.is_main_process:
+        acc_steps = accelerator.gradient_accumulation_steps
+        log_print(f"[init] TMA_epoch={TMA_epoch}, acc_steps={acc_steps}, D_UPDATE_EVERY={D_UPDATE_EVERY}", logger)
+
     class EMA:
         def __init__(self, module, decay=0.999):
             self.decay = decay
@@ -208,8 +239,10 @@ def main(config_path):
             self.m.load_state_dict(self.shadow, strict=False)
         @torch.no_grad()
         def restore(self):
-            self.m.load_state_dict(self.backup, strict=False)
-            self.backup = None
+            # Only restore if we actually applied EMA weights
+            if self.backup is not None:
+                self.m.load_state_dict(self.backup, strict=False)
+                self.backup = None
 
     def _unwrap(m):
         return m.module if hasattr(m, "module") else m
@@ -264,6 +297,13 @@ def main(config_path):
         start_time = time.time()
 
         acc_steps = accelerator.gradient_accumulation_steps
+        # align console logging with discriminator cadence so D+ appears regularly
+        cadence = acc_steps * D_UPDATE_EVERY
+        if log_interval % cadence != 0:
+            log_interval = cadence
+            if accelerator.is_main_process:
+                log_print(f"[log] log_interval -> {log_interval} (aligned to D cadence)", logger)
+
 
         _ = [model[key].train() for key in model]
 
@@ -314,7 +354,7 @@ def main(config_path):
                 else accelerator.gather(mel_input_length)
             )
 
-            effective_max_len = 160 if (epoch < TMA_epoch + 2) else max_len
+            effective_max_len = 160 if (epoch < TMA_epoch + 1) else max_len
             base_mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), effective_max_len // 2])
             base_mel_len_st = int(mel_input_length.min().item() / 2 - 1)
 
@@ -386,23 +426,39 @@ def main(config_path):
             wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
 
             # clip too short to be used by the style encoder
-            if gt.shape[-1] < 80:
+            if gt.shape[-1] < 96:
                 continue
                 
             with torch.no_grad():    
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1).detach()
+
+            if epoch < TMA_epoch:
+                with torch.no_grad():
+                    F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
+            else:
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                
-            s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
             
+            s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+            # strong numeric guard: keep validation/train stable if upstream produced bad values
+            s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # First try with whatever the model dtype currently is (bf16 under Accelerate)
             y_rec = model.decoder(en, F0_real, real_norm, s)
+            # If something explodes numerically, skip this batch (do NOT FP32-retry in TRAIN)
+            if not torch.isfinite(y_rec).all():
+                if accelerator.is_main_process:
+                    log_print("[train] non-finite decoder output; skipping batch", logger)
+                optimizer.zero_grad(set_to_none=True)
+                continue
             
             # ---------- Discriminator loss (gated cadence) ----------
             d_loss_val = 0.0
+            did_d_update = False
             with accelerator.accumulate(model["mpd"]):  # any model key works
                 if epoch >= TMA_epoch and accelerator.sync_gradients:
                     # Only update D every Nth accumulation boundary
                     do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
+                    log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
                     if do_d_update:
                         d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
                         accelerator.backward(d_loss / acc_steps)
@@ -410,13 +466,20 @@ def main(config_path):
                         optimizer.step('msd')
                         optimizer.step('mpd')
                         d_loss_val = float(d_loss.detach().item())
+                        did_d_update = True
                     # Note: grads are cleared globally below with optimizer.zero_grad(...)
                 # else: skip D forward/back entirely for real compute savings
 
 
             with accelerator.accumulate(model["decoder"]):
                 # no zero_grad here; we’re accumulating
-                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                loss_mel = stft_loss(y_rec.squeeze().float(), wav.detach())
+
+                # strong numeric guard — skip batch if non-finite
+                if not torch.isfinite(loss_mel):
+                    if accelerator.is_main_process:
+                        log_print(f"[val] non-finite loss_mel={loss_mel.item()} — skipping batch", logger)
+                    continue
 
                 if epoch >= TMA_epoch:  # start TMA training
                     loss_s2s = 0
@@ -504,15 +567,18 @@ def main(config_path):
             iters = iters + 1
             
             if (i+1)%log_interval == 0 and accelerator.is_main_process:
-                log_print ('Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
-                        %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
+                d_marker = "D+" if did_d_update else "D-"
+                log_print ('Epoch [%d/%d], Step [%d/%d], %s | Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
+                        %(epoch+1, epochs, i+1, len(train_list)//batch_size, d_marker, running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
                 
                 writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
                 writer.add_scalar('train/gen_loss', loss_gen_all, iters)
                 writer.add_scalar('train/d_loss', d_loss, iters)
+                writer.add_scalar('train/did_d_update', float(did_d_update), iters)
                 writer.add_scalar('train/mono_loss', loss_mono, iters)
                 writer.add_scalar('train/s2s_loss', loss_s2s, iters)
                 writer.add_scalar('train/slm_loss', loss_slm, iters)
+                
 
                 running_loss = 0
                 
@@ -528,9 +594,14 @@ def main(config_path):
 
         effective_max_len = 160 if (epoch < TMA_epoch + 2) else max_len
 
+        # Swap in EMA weights for evaluation (restore after all eval/saving)
         for _k in ema: ema[_k].apply_to()
-        with torch.no_grad():
+
+        # full-FP32 validation autocast disabled and FP32 retry if needed
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
             iters_test = 0
+            skipped = {"too_short": 0, "silent": 0, "nonfinite_out": 0, "nonfinite_loss": 0}
+            
             for batch_idx, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
@@ -550,12 +621,25 @@ def main(config_path):
                     attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
                     attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                     attn_mask = (attn_mask < 1)
+
                     s2s_attn.masked_fill_(attn_mask, 0.0)
 
-                # encode
+                    # --- NEW: sanitize attention + row-renormalize ---
+                    s2s_attn = torch.nan_to_num(s2s_attn, nan=0.0, posinf=0.0, neginf=0.0)
+                    row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    s2s_attn = s2s_attn / row_sum
+                    # --- NEW: build a monotonic fallback path ---
+                    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn, mask_ST).float()
+                    s2s_attn_mono = torch.nan_to_num(s2s_attn_mono, 0.0, 0.0, 0.0)
+
+                # encode + sanitize encoder output before matmul
                 t_en = model.text_encoder(texts, input_lengths, text_mask)
-                
-                asr = (t_en @ s2s_attn)
+                t_en = torch.nan_to_num(t_en, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # acoustic reps: normal and monotonic-fallback
+                asr      = t_en @ s2s_attn
+                asr_mono = t_en @ s2s_attn_mono
 
                 # get clips
 
@@ -574,6 +658,8 @@ def main(config_path):
                 mel_len    = max(40, _bucket_half_len_floor(int(base_mel_len * cf)))
                 
                 en = []
+                en_mono_list = []
+                starts = []
                 gt = []
                 wav = []
 
@@ -584,7 +670,9 @@ def main(config_path):
                     mel_length = int(mel_input_length[bib].item() / 2)
                     # With floor-bucket and min-half calculation, randint high is guaranteed > 0
                     random_start = np.random.randint(0, mel_length - mel_len)
+                    starts.append(random_start)
                     en.append(asr[bib, :, random_start:random_start + mel_len])
+                    en_mono_list.append(asr_mono[bib, :, random_start:random_start + mel_len])
                     gt.append(mels[bib, :, (random_start * 2):((random_start + mel_len) * 2)])
                     y = waves[bib][(random_start * 2) * 300:((random_start + mel_len) * 2) * 300]
 
@@ -593,11 +681,13 @@ def main(config_path):
                 wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
 
                 en = torch.stack(en)
+                en_mono = torch.stack(en_mono_list)
                 gt = torch.stack(gt).detach()
 
                 # --- Validation guards: too-short or too-silent windows ---
                 # Too-short (frames) for downstream modules
-                if gt.shape[-1] < 80:
+                if gt.shape[-1] < 96:
+                    skipped["too_short"] += 1
                     continue
                 # Too-silent: STFT spectral convergence can NaN when target norm ~ 0.
                 # 1-second window at 24kHz -> this catches flat/silent crops.
@@ -607,40 +697,62 @@ def main(config_path):
                     # Optional: uncomment to log once per batch
                     if accelerator.is_main_process:
                         log_print("[val] silent batch; skipping", logger)
+                    skipped["silent"] += 1
                     continue
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                 s = model.style_encoder(gt.unsqueeze(1))
+                # numeric guard to avoid NaNs/Inf leaking into decoder
+                s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
 
                 # Optional numeric guard (cheap, avoids rare NaNs from upstream components)
                 F0_real  = torch.nan_to_num(F0_real, nan=0.0, posinf=0.0, neginf=0.0)
                 real_norm = torch.nan_to_num(real_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
-                y_rec = model.decoder(en, F0_real, real_norm, s)
+                y_rec = model.decoder(en.float(), F0_real.float(), real_norm.float(), s)
 
                 if not torch.isfinite(y_rec).all():
-                    if accelerator.is_main_process:
-                        log_print("[val] non-finite model output; skipping batch", logger)
-                    continue
+                    dec_mod = getattr(model["decoder"], "module", model["decoder"])
+                    try:
+                        orig_dtype = next(dec_mod.parameters()).dtype
+                    except StopIteration:
+                        orig_dtype = torch.bfloat16
+                    try:
+                        dec_mod.to(torch.float32)
+                        y_rec = dec_mod(en.float(), F0_real.float(), real_norm.float(), s.float())
+                    finally:
+                        dec_mod.to(orig_dtype)
+                    if not torch.isfinite(y_rec).all():
+                        # --- NEW: monotonic attention fallback once ---
+                        if accelerator.is_main_process:
+                            log_print("[val] still non-finite after fp32; trying monotonic attention fallback", logger)
+                        y_rec = dec_mod(en_mono.float(), F0_real.float(), real_norm.float(), s.float())
+                        if not torch.isfinite(y_rec).all():
+                            skipped["nonfinite_out"] += 1
+                            if accelerator.is_main_process:
+                                log_print("[val] decoder still non-finite after fp32 + monotonic fallback; skipping batch", logger)
+                            continue
 
-                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                loss_mel = stft_loss(y_rec.squeeze().float(), wav.detach())
+                
                 # Skip non-finite losses to avoid poisoning the epoch average
                 loss_mel_g = accelerator.gather(loss_mel).mean()
                 if not torch.isfinite(loss_mel_g):
+                    skipped["nonfinite_loss"] += 1
                     if accelerator.is_main_process:
                         log_print("[val] non-finite loss encountered; skipping batch", logger)
                     continue
                 loss_test += loss_mel_g.item()
                 iters_test += 1
 
-        #restore training weights
-        for _k in ema: ema[_k].restore()
         log_print(f"Time elapsed in the overall Epoch: {time.time() - start_time:.2f} seconds", logger)
         
 
         if accelerator.is_main_process:
             log_print(f"Epochs: {epoch + 1}", logger)
             val_avg = (loss_test / iters_test) if iters_test > 0 else float('nan')
+        if accelerator.is_main_process:
+            log_print(f"[val] iters={iters_test} skipped={skipped}", logger)
             last_val_avg = val_avg
             log_print(f"Validation loss: {val_avg:.3f}\n\n\n\n", logger)
             log_print('\n\n\n', logger)
@@ -660,11 +772,23 @@ def main(config_path):
                     F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
                     F0_real = F0_real.unsqueeze(0)
                     s = model.style_encoder(gt.unsqueeze(1))
+                    # strong numeric guard: keep validation/train stable if upstream produced bad values
+                    s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+                
                     real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
-                    
+
                     y_rec = model.decoder(en, F0_real, real_norm, s)
-                    
-                    writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
+                    if not torch.isfinite(y_rec).all():
+                        dec_mod = getattr(model["decoder"], "module", model["decoder"])
+                        orig_dtype = next(dec_mod.parameters()).dtype
+                        try:
+                            dec_mod.to(torch.float32)
+                            y_rec = dec_mod(en.float(), F0_real.float(), real_norm.float(), s.float())
+                        finally:
+                            dec_mod.to(orig_dtype)
+                    if torch.isfinite(y_rec).all():
+                        writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)                    
+
                     if epoch == 0:
                         writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
                     
@@ -691,7 +815,7 @@ def main(config_path):
                 try:
                     max_alloc_mb = (torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
                     max_resv_mb  = (torch.cuda.max_memory_reserved()  / (1024**2)) if torch.cuda.is_available() else 0.0
-                    logger.info(f"[mem] epoch={epoch} max_alloc={max_alloc_mb:.1f} MiB max_reserved={max_resv_mb:.1f} MiB")
+                    logger.info(f"[mem] epoch={epoch + 1} max_alloc={max_alloc_mb:.1f} MiB max_reserved={max_resv_mb:.1f} MiB")
                     top_mel = sorted(mel_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
                     top_sty = sorted(style_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
                     logger.info(f"[buckets] mel_top={top_mel} style_top={top_sty}")
@@ -700,6 +824,9 @@ def main(config_path):
                         json.dump({"mel": dict(mel_bucket_counts), "style": dict(style_bucket_counts)}, f, indent=2)
                 except Exception as _e:
                     logger.warning(f"bucket/memory logging failed: {_e}")
+        
+        # Now that ALL eval/saving is done, restore training weights on every rank
+        for _k in ema: ema[_k].restore()
                                 
     if accelerator.is_main_process:
         log_print('Saving..', logger)
