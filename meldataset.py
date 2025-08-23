@@ -111,7 +111,7 @@ class FilePathDataset(torch.utils.data.Dataset):
         self._cache = OrderedDict()
         # Tune via env var; this is a count of wave entries (not MB)
         # With N workers, total cached entries ≈ N * DATASET_CACHE_CAP
-        self._cache_cap = int(os.environ.get("DATASET_CACHE_CAP", "4096"))
+        self._cache_cap = int(os.environ.get("DATASET_CACHE_CAP", "8192"))
         
         self.min_length = min_length
         with open(OOD_data, 'r', encoding='utf-8') as f:

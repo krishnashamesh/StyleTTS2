@@ -1,7 +1,6 @@
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
-os.environ.setdefault("D_UPDATE_EVERY", "2")
 
 import os.path as osp
 import re
@@ -38,8 +37,6 @@ from accelerate import Accelerator
 from accelerate.utils import LoggerType
 from accelerate import DistributedDataParallelKwargs
 
-from torch.utils.tensorboard import SummaryWriter
-
 try:
     from torch.backends.cuda import sdp_kernel
     sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
@@ -70,6 +67,23 @@ def main(config_path):
     _start_logger_auto_flush(logger.logger)
     _install_signal_handlers(logger.logger)
 
+        # --- simple mem logger using torch.cuda.mem_get_info() ---
+    def _log_free(tag: str, step: int):
+        if torch.cuda.is_available() and accelerator.is_main_process:
+            free_b, total_b = torch.cuda.mem_get_info()
+            free_pct = (free_b / max(1, total_b)) * 100.0
+            log_print(f"[mem] {tag}: free={free_b/1e9:.2f}GB ({free_pct:.1f}%)", logger)
+    # --- targeted allocator trim points for cudaMallocAsync ---
+    def _trim_cache(tag: str):
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                if accelerator.is_main_process:
+                    log_print(f"[alloc] trim -> empty_cache() ({tag})", logger)
+        except Exception as _e:
+            if accelerator.is_main_process: log_print(f"[alloc] trim failed: {_e}", logger)
+
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
@@ -85,6 +99,30 @@ def main(config_path):
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
+    # ---- Adaptive GA: start high, drop on low headroom ----
+    BASE_GA = int(grad_accum)
+    GA_MAX  = int(config.get("ga_max", "8"))
+    GA_MIN  = int(config.get("ga_min", "2"))
+    GA_START_HIGH_PCT = float(config.get("ga_start_high_pct", "140.0"))  # e.g., 5 -> 7
+    start_ga = max(GA_MIN, min(GA_MAX, int(math.ceil(BASE_GA * GA_START_HIGH_PCT / 100.0))))
+    accelerator.gradient_accumulation_steps = start_ga
+    if accelerator.is_main_process:
+        log_print(f"[ga] start-high: base={BASE_GA} -> current={start_ga}", logger)
+
+    # Drop GA if free VRAM % falls below threshold at an accumulation boundary
+    FREE_LOW_PCT = float(config.get("ga_free_low_pct", "8.0"))
+    FREE_HIGH_PCT    = float(config.get("ga_free_high_pct",  "18.0"))  # grow when >= this
+    GA_GROW_PATIENCE = int  (config.get("ga_grow_patience",  "3"))     # boundaries in a row
+    GA_GROW_COOLDOWN = int  (config.get("ga_grow_cooldown",  "4"))     # boundaries to wait after any change
+    ga_safe_count    = 0   # consecutive “safe & high-headroom” boundaries
+    ga_cooldown      = 0   # boundary countdown until next adjustment allowed
+
+    # For LR scaling vs. effective batch (E = micro * GA)
+    E_BASE = batch_size * BASE_GA
+    def _apply_lr_scale(scale: float):
+        # will be bound after optimizers are built
+        pass
+
     # ---- Tunables via env (sane speed-leaning defaults) ----
     D_UPDATE_EVERY   = int(os.getenv("D_UPDATE_EVERY", "2"))  # update D every N G updates
     SLM_UPDATE_EVERY = int(os.getenv("SLM_UPDATE_EVERY", "2"))  # compute WavLM loss every N G updates
@@ -95,10 +133,6 @@ def main(config_path):
     # Curriculum warmup (fraction of total epochs) and start factor
     CURRIC_WARM_FRAC = float(os.getenv("CURRIC_WARM_FRAC", "0.10"))
     CURRIC_START     = float(os.getenv("CURRIC_START",     "0.90"))
-    
-    
-    if accelerator.is_main_process:
-        writer = SummaryWriter(log_dir + "/tensorboard")
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -108,6 +142,8 @@ def main(config_path):
     
 
     device = accelerator.device
+
+    _log_free('init', 0)
     
     epochs = config.get('epochs_1st', 200)
     save_freq = config.get('save_freq', 2)
@@ -130,7 +166,7 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     #Performance improvement
-    nw = min(30, os.cpu_count())
+    nw = min(32, os.cpu_count())
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -139,7 +175,7 @@ def main(config_path):
                                         batch_size=batch_size,
                                         num_workers=nw,
                                         dataset_config=ds_cfg,
-                                        prefetch_factor=8,
+                                        prefetch_factor=32,
                                         persistent_workers=True,
                                         device=device)
 
@@ -151,7 +187,7 @@ def main(config_path):
                                       validation=True,
                                       num_workers=nw,
                                       device=device,
-                                      prefetch_factor=8,
+                                      prefetch_factor=32,
                                       persistent_workers=True,
                                       dataset_config=ds_cfg)
     
@@ -206,8 +242,10 @@ def main(config_path):
     train_dataloader, val_dataloader = accelerator.prepare(
         train_dataloader, val_dataloader
     )
+    _log_free('post_prepare', 0)
     
     _ = [model[key].to(device) for key in model]
+    _log_free('post_model_to', 0)
 
     # After wrapping, confirm decoder memory format
     try:
@@ -227,12 +265,12 @@ def main(config_path):
         def __init__(self, module, decay=0.999):
             self.decay = decay
             self.m = module
-            self.shadow = {k: p.detach().clone().float() for k,p in self.m.state_dict().items()}
+            self.shadow = {k: p.detach().to("cpu", dtype=torch.float32).clone().float() for k,p in self.m.state_dict().items()}
             self.backup = None
         @torch.no_grad()
         def update(self):
             for k, p in self.m.state_dict().items():
-                self.shadow[k].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+                self.shadow[k].mul_(self.decay).add_(p.detach().to("cpu", dtype=torch.float32), alpha=1.0 - self.decay)
         @torch.no_grad()
         def apply_to(self):
             self.backup = {k: p.detach().clone() for k,p in self.m.state_dict().items()}
@@ -262,6 +300,15 @@ def main(config_path):
     for k, v in optimizer.optimizers.items():
         optimizer.optimizers[k] = accelerator.prepare(optimizer.optimizers[k])
         optimizer.schedulers[k] = accelerator.prepare(optimizer.schedulers[k])
+
+    # --- LR scaling hook (keep optimizer shape; just scale param group lrs) ---
+    _base_lrs = {name: [pg["lr"] for pg in opt.param_groups]
+                 for name, opt in optimizer.optimizers.items()}
+    def _apply_lr_scale(scale: float):
+        for name, opt in optimizer.optimizers.items():
+            blrs = _base_lrs[name]
+            for pg, blr in zip(opt.param_groups, blrs):
+                pg["lr"] = float(blr) * float(scale)
     
     with accelerator.main_process_first():
         if config.get('pretrained_model', '') != '':
@@ -277,10 +324,13 @@ def main(config_path):
     except:
         n_down = model.text_aligner.n_down
     
-    # wrapped losses for compatibility with mixed precision
+    # losses: pass UNWRAPPED D modules to avoid Accelerate's fp32 output conversion (6b)
     stft_loss = MultiResolutionSTFTLoss().to(device)
-    gl = GeneratorLoss(model.mpd, model.msd).to(device)
-    dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
+    fm_chunks = int(config.get("fm_max_chunks", 8))
+    gl = GeneratorLoss(accelerator.unwrap_model(model.mpd),
+                       accelerator.unwrap_model(model.msd), fm_max_chunks=fm_chunks).to(device)
+    dl = DiscriminatorLoss(accelerator.unwrap_model(model.mpd),
+                           accelerator.unwrap_model(model.msd)).to(device)
     wl = WavLMLoss(model_params.slm.model, 
                    model.wd, 
                    sr, 
@@ -296,26 +346,39 @@ def main(config_path):
         running_loss = 0
         start_time = time.time()
 
-        acc_steps = accelerator.gradient_accumulation_steps
+        # ---- reset GA to start_ga at the beginning of every epoch ----
+        accelerator.gradient_accumulation_steps = start_ga
+        acc_steps = start_ga
+        # reset growth state so increases require a fresh safe streak
+        ga_safe_count = 0
+        ga_cooldown   = GA_GROW_COOLDOWN
+        # rescale LR to the new effective batch (E = micro * GA)
+        eff_scale = (batch_size * acc_steps) / max(1.0, float(E_BASE))
+        _apply_lr_scale(eff_scale)
+        if accelerator.is_main_process:
+            log_print(f"[ga] epoch-reset -> {acc_steps} (eff_scale={eff_scale:.2f})", logger)
+        # keep allocator tidy at phase boundary
+        _trim_cache("epoch-reset")
         # align console logging with discriminator cadence so D+ appears regularly
         cadence = acc_steps * D_UPDATE_EVERY
+
         if log_interval % cadence != 0:
             log_interval = cadence
             if accelerator.is_main_process:
                 log_print(f"[log] log_interval -> {log_interval} (aligned to D cadence)", logger)
 
-
         _ = [model[key].train() for key in model]
 
         for i, batch in enumerate(train_dataloader):
-            #log_print(f"Starting Batch {i}: Size = {len(batch[0])}", logger)
             waves = batch[0]
+            _log_free('pre_h2d', iters)
             batch = [b.to(device, non_blocking=True) for b in batch[1:]]
             texts, input_lengths, _, _, mels, mel_input_length, _ = batch
             
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                 text_mask = length_to_mask(input_lengths).to(texts.device)
+            _log_free('pre_step', iters)
 
             if epoch < TMA_epoch:
                 with torch.no_grad():
@@ -424,6 +487,7 @@ def main(config_path):
             st = torch.stack(st).detach()
 
             wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+            _log_free('post_h2d', iters)
 
             # clip too short to be used by the style encoder
             if gt.shape[-1] < 96:
@@ -450,26 +514,6 @@ def main(config_path):
                     log_print("[train] non-finite decoder output; skipping batch", logger)
                 optimizer.zero_grad(set_to_none=True)
                 continue
-            
-            # ---------- Discriminator loss (gated cadence) ----------
-            d_loss_val = 0.0
-            did_d_update = False
-            with accelerator.accumulate(model["mpd"]):  # any model key works
-                if epoch >= TMA_epoch and accelerator.sync_gradients:
-                    # Only update D every Nth accumulation boundary
-                    do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
-                    log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
-                    if do_d_update:
-                        d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
-                        accelerator.backward(d_loss / acc_steps)
-                        # step both discriminators
-                        optimizer.step('msd')
-                        optimizer.step('mpd')
-                        d_loss_val = float(d_loss.detach().item())
-                        did_d_update = True
-                    # Note: grads are cleared globally below with optimizer.zero_grad(...)
-                # else: skip D forward/back entirely for real compute savings
-
 
             with accelerator.accumulate(model["decoder"]):
                 # no zero_grad here; we’re accumulating
@@ -488,7 +532,8 @@ def main(config_path):
                     loss_s2s /= texts.size(0)
 
                     loss_mono    = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
-                    loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
+                    # keep bf16 through the D path (avoid inflating activations at the worst time)
+                    loss_gen_all = gl(wav.detach().unsqueeze(1), y_rec).mean()
                     # Intermittent WavLM feature loss to save compute
                     if SLM_UPDATE_EVERY <= 1:
                         loss_slm = wl(wav.detach(), y_rec).mean()
@@ -514,10 +559,13 @@ def main(config_path):
                     g_loss = loss_mel
 
                 running_loss += accelerator.gather(loss_mel).mean().item()
-
+                # live GA (may have been changed earlier this epoch)
+                acc_steps = accelerator.gradient_accumulation_steps
                 accelerator.backward(g_loss / acc_steps)
+                _log_free('post_gbwd', iters)
 
                 if accelerator.sync_gradients:  # only step/zero at the accumulation boundary
+                    _log_free('pre_boundary', iters)
                     def _clip_and_check(name, max_norm=1.0):
                         torch.nn.utils.clip_grad_norm_(model[name].parameters(),
                                                        max_norm, error_if_nonfinite=False, foreach=False)
@@ -556,35 +604,110 @@ def main(config_path):
                         if _clip_and_check('text_aligner'):    _safe_step('text_aligner')
                         if _clip_and_check('pitch_extractor'): _safe_step('pitch_extractor')
 
+                    _log_free('post_gstep', iters)
                     optimizer.zero_grad(set_to_none=True)
+                    _log_free('post_zero', iters)
 
                     # EMA only when we actually stepped
                     ema["text_encoder"].update()
                     ema["style_encoder"].update()
                     ema["decoder"].update()
+
+            # ---------- Discriminator loss (gated cadence) ----------
+            d_loss_val = 0.0
+            did_d_update = False
+            with accelerator.accumulate(model["mpd"]):  # any model key works
+                if epoch >= TMA_epoch and accelerator.sync_gradients:
+                    # live GA for cadence and scaling
+                    acc_steps = accelerator.gradient_accumulation_steps
+                    # Only update D every Nth accumulation boundary
+                    do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
+                    log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
+                    if do_d_update:
+                        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                            d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean()
+                        d_loss_fp32 = d_loss.float()
+                        accelerator.backward(d_loss_fp32 / acc_steps)
+                        # step both discriminators
+                        optimizer.step('msd')
+                        optimizer.step('mpd')
+                        _log_free('post_dstep', iters)
+                        d_loss_val = float(d_loss.detach().item())
+                        did_d_update = True
+                    # Note: grads are cleared globally below with optimizer.zero_grad(...)
+                # else: skip D forward/back entirely for real compute savings
+
           
             d_loss = d_loss_val
             iters = iters + 1
-            
+
+            # ---- Accumulation boundary headroom check ----
+            if accelerator.sync_gradients and torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                free_pct = (free_b / max(1, total_b)) * 100.0
+                if accelerator.is_main_process:
+                    log_print(f"[mem] boundary: free={free_b/1e9:.2f}GB ({free_pct:.1f}%), ga={accelerator.gradient_accumulation_steps}", logger)
+                # cooldown ticks down every boundary
+                if ga_cooldown > 0:
+                    ga_cooldown -= 1
+
+                # 1) DROP when headroom below fuse
+                if free_pct < FREE_LOW_PCT and accelerator.gradient_accumulation_steps > GA_MIN:
+                    new_ga = accelerator.gradient_accumulation_steps - 1
+                    accelerator.gradient_accumulation_steps = new_ga
+                    # re-scale LR to new effective batch
+                    eff_scale = (batch_size * new_ga) / max(1.0, float(E_BASE))
+                    _apply_lr_scale(eff_scale)
+                    if accelerator.is_main_process:
+                        log_print(f"[ga] drop -> {new_ga} (free={free_pct:.1f}%)", logger)
+                    # realign logging cadence for next steps
+                    cadence_new = new_ga * D_UPDATE_EVERY
+                    if log_interval % cadence_new != 0:
+                        log_interval = cadence_new
+                    # reset growth state and start cooldown
+                    ga_safe_count = 0
+                    ga_cooldown   = GA_GROW_COOLDOWN
+
+                # 2) GROW when headroom stays high for a few boundaries (and not cooling down)
+                elif (free_pct >= FREE_HIGH_PCT
+                      and accelerator.gradient_accumulation_steps < GA_MAX
+                      and ga_cooldown == 0):
+                    ga_safe_count += 1
+                    if ga_safe_count >= GA_GROW_PATIENCE:
+                        new_ga = accelerator.gradient_accumulation_steps + 1
+                        accelerator.gradient_accumulation_steps = new_ga
+                        eff_scale = (batch_size * new_ga) / max(1.0, float(E_BASE))
+                        _apply_lr_scale(eff_scale)
+                        if accelerator.is_main_process:
+                            log_print(f"[ga] rise -> {new_ga} (free={free_pct:.1f}%, safe={ga_safe_count})", logger)
+                        cadence_new = new_ga * D_UPDATE_EVERY
+                        if log_interval % cadence_new != 0:
+                            log_interval = cadence_new
+                        # reset + cooldown so we don't immediately step again
+                        ga_safe_count = 0
+                        ga_cooldown   = GA_GROW_COOLDOWN
+
+                # 3) Mid zone: neither low nor high → reset streak
+                else:
+                    if free_pct < FREE_HIGH_PCT:
+                        ga_safe_count = 0
+    
+                # 4) Gentle trim when plenty of headroom (helps long runs)
+                #    Won't change GA; just nudge the pool to return idle blocks.
+                if free_pct >= (FREE_HIGH_PCT + 7.0):  # e.g., ≥ ~26% if HIGH is 18%
+                    if accelerator.is_main_process:
+                        log_print(f"[alloc] trim -> empty_cache() (headroom)", logger)
+                    torch.cuda.empty_cache()
+
+
             if (i+1)%log_interval == 0 and accelerator.is_main_process:
                 d_marker = "D+" if did_d_update else "D-"
                 log_print ('Epoch [%d/%d], Step [%d/%d], %s | Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
                         %(epoch+1, epochs, i+1, len(train_list)//batch_size, d_marker, running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
-                
-                writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
-                writer.add_scalar('train/gen_loss', loss_gen_all, iters)
-                writer.add_scalar('train/d_loss', d_loss, iters)
-                writer.add_scalar('train/did_d_update', float(did_d_update), iters)
-                writer.add_scalar('train/mono_loss', loss_mono, iters)
-                writer.add_scalar('train/s2s_loss', loss_s2s, iters)
-                writer.add_scalar('train/slm_loss', loss_slm, iters)
-                
 
                 running_loss = 0
                 
-                #log_print('Time elasped:', time.time()-start_time, logger)
                 log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
-                # log_print(f"Ending Batch {i}: Size = {len(batch[0])}", logger)
                                 
         loss_test = 0
 
@@ -596,6 +719,7 @@ def main(config_path):
 
         # Swap in EMA weights for evaluation (restore after all eval/saving)
         for _k in ema: ema[_k].apply_to()
+        _log_free('pre_val', epoch)
 
         # full-FP32 validation autocast disabled and FP32 retry if needed
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
@@ -755,49 +879,13 @@ def main(config_path):
             log_print(f"[val] iters={iters_test} skipped={skipped}", logger)
             last_val_avg = val_avg
             log_print(f"Validation loss: {val_avg:.3f}\n\n\n\n", logger)
+            _log_free('epoch_end', epoch + 1)
             log_print('\n\n\n', logger)
-
-            if iters_test > 0:
-                writer.add_scalar('eval/mel_loss', val_avg, epoch + 1)
-
-            attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
-            writer.add_figure('eval/attn', attn_image, epoch)
-            
-            with torch.no_grad():
-                for bib in range(len(asr)):
-                    mel_length = int(mel_input_length[bib].item())
-                    gt = mels[bib, :, :mel_length].unsqueeze(0)
-                    en = asr[bib, :, :mel_length // 2].unsqueeze(0)
-                                        
-                    F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                    F0_real = F0_real.unsqueeze(0)
-                    s = model.style_encoder(gt.unsqueeze(1))
-                    # strong numeric guard: keep validation/train stable if upstream produced bad values
-                    s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                    real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
-
-                    y_rec = model.decoder(en, F0_real, real_norm, s)
-                    if not torch.isfinite(y_rec).all():
-                        dec_mod = getattr(model["decoder"], "module", model["decoder"])
-                        orig_dtype = next(dec_mod.parameters()).dtype
-                        try:
-                            dec_mod.to(torch.float32)
-                            y_rec = dec_mod(en.float(), F0_real.float(), real_norm.float(), s.float())
-                        finally:
-                            dec_mod.to(orig_dtype)
-                    if torch.isfinite(y_rec).all():
-                        writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)                    
-
-                    if epoch == 0:
-                        writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
-                    
-                    if bib >= 6:
-                        break
 
             if epoch % saving_epoch == 0:
                 if iters_test > 0 and (val_avg < best_loss):
                     best_loss = val_avg
+                _log_free('pre_save', epoch)
                 log_print('Saving..', logger)
                 state = {
                     'net':  {key: model[key].state_dict() for key in model}, 
@@ -819,16 +907,17 @@ def main(config_path):
                     top_mel = sorted(mel_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
                     top_sty = sorted(style_bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
                     logger.info(f"[buckets] mel_top={top_mel} style_top={top_sty}")
-                    dist_path = osp.join(log_dir, f"epoch_{epoch:05d}_buckets.json")
-                    with open(dist_path, "w") as f:
-                        json.dump({"mel": dict(mel_bucket_counts), "style": dict(style_bucket_counts)}, f, indent=2)
                 except Exception as _e:
                     logger.warning(f"bucket/memory logging failed: {_e}")
         
         # Now that ALL eval/saving is done, restore training weights on every rank
+        _log_free('post_val', epoch)
         for _k in ema: ema[_k].restore()
+        _trim_cache("ga-drop")
+        _log_free('post_restore', epoch)
                                 
     if accelerator.is_main_process:
+        _log_free('pre_save', epoch)
         log_print('Saving..', logger)
         state = {
             'net':  {key: model[key].state_dict() for key in model}, 
@@ -842,7 +931,6 @@ def main(config_path):
 
         gc.collect()
         torch.cuda.empty_cache()
-
         
 
 # ------------------------------------------------------------------

@@ -5,8 +5,16 @@ log_interval: 10
 device: "cuda"
 epochs_1st: 5 # number of epochs for first stage training (pre-training)
 epochs_2nd: 2 # number of epeochs for second stage training (joint training)
-batch_size: 3
+batch_size: 5
 grad_accum: 4
+ga_max: 12
+ga_min: 2
+ga_start_high_pct: 140.0
+ga_free_low_pct: 12.0
+ga_free_high_pct: 28.0
+ga_grow_patience: 1
+ga_grow_cooldown: 1
+fm_max_chunks: 32
 max_len: 1000 # maximum number of frames
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage

@@ -94,13 +94,50 @@ class MultiResolutionSTFTLoss(torch.nn.Module):
         return sc_loss
     
     
-def feature_loss(fmap_r, fmap_g):
-    loss = 0
+@torch.no_grad()
+def _lastdim_chunk_bounds(L: int, max_chunks: int = 4):
+    """
+    Split a length L into <= max_chunks nearly-equal segments.
+    Always returns at least one chunk.
+    """
+    max_chunks = max(1, int(max_chunks))
+    if L <= 0:
+        return [(0, 0)]
+    n_chunks = min(max_chunks, L)
+    base = L // n_chunks
+    rem  = L %  n_chunks
+    bounds = []
+    start = 0
+    for i in range(n_chunks):
+        seg = base + (1 if i < rem else 0)
+        bounds.append((start, start + seg))
+        start += seg
+    return bounds
+
+# memory-safe feature matching:
+# - stream across last dimension in chunks
+# - accumulate abs-diff in fp32 and normalize by total elements
+def feature_loss(fmap_r, fmap_g, max_chunks: int = 8):
+    total_loss = 0.0
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
+            # shape can be [B,C,T] (MSD/MPD) or [B,C,H,W]; we chunk along the last dim
+            assert rl.shape == gl.shape, "Feature map shapes must match"
+            numel  = rl.numel()
+            last_L = rl.shape[-1]
 
-    return loss*2
+            # stream over last dimension
+            part_sum = rl.new_tensor(0.0, dtype=torch.float32)
+            for s, e in _lastdim_chunk_bounds(last_L, max_chunks=max_chunks):
+                r = rl[..., s:e]
+                g = gl[..., s:e]
+                # accumulate in fp32 for numerical stability in bf16 runs
+                part_sum += (g - r).abs().float().sum()
+
+            # mean over all elements (same scale as original code)
+            total_loss = total_loss + (part_sum / float(numel))
+
+    return total_loss * 2.0
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
@@ -148,16 +185,47 @@ def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
 
 class GeneratorLoss(torch.nn.Module):
 
-    def __init__(self, mpd, msd):
+    def __init__(self, mpd, msd, fm_max_chunks: int = 8):
         super(GeneratorLoss, self).__init__()
+        # UNWRAPPED modules are passed in from train_first.py (6b)
         self.mpd = mpd
         self.msd = msd
+        self.fm_max_chunks = int(fm_max_chunks)
+        # Best effort: many HifiGAN-style Ds expose a 'discriminators' list
+        self._mpd_list = getattr(self.mpd, "discriminators", None)
+        self._msd_list = getattr(self.msd, "discriminators", None)
+
+    def _split_forward(self, disc_list, y, y_hat):
+        """Run real under inference_mode (bf16) and fake with grads (bf16)."""
+        y_r_list, y_g_list, fmap_r_list, fmap_g_list = [], [], [], []
+        # Real branch — no autograd state (6a)
+        with torch.inference_mode():
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                for d in disc_list:
+                    y_r, fmap_r = d(y)
+                    y_r_list.append(y_r)
+                    fmap_r_list.append(fmap_r)
+        # Fake branch — needs grads for G
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+           for d in disc_list:
+                y_g, fmap_g = d(y_hat)
+                y_g_list.append(y_g)
+                fmap_g_list.append(fmap_g)
+        return y_r_list, y_g_list, fmap_r_list, fmap_g_list
         
     def forward(self, y, y_hat):
-        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat)
-        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat)
-        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+
+        # Prefer split path (6a); fallback to combined call if unavailable
+        if self._mpd_list is not None and self._msd_list is not None:
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self._split_forward(self._mpd_list, y, y_hat)
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self._split_forward(self._msd_list, y, y_hat)
+        else:
+            # Combined call as a safe fallback
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat)
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat)
+
+        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g, max_chunks=self.fm_max_chunks)
+        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g, max_chunks=self.fm_max_chunks)
         loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
         loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
 
