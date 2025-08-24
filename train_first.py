@@ -124,8 +124,8 @@ def main(config_path):
         pass
 
     # ---- Tunables via env (sane speed-leaning defaults) ----
-    D_UPDATE_EVERY   = int(os.getenv("D_UPDATE_EVERY", "2"))  # update D every N G updates
-    SLM_UPDATE_EVERY = int(os.getenv("SLM_UPDATE_EVERY", "2"))  # compute WavLM loss every N G updates
+    D_UPDATE_EVERY   = int(os.getenv("D_UPDATE_EVERY", "1"))  # update D every N G updates
+    SLM_UPDATE_EVERY = int(os.getenv("SLM_UPDATE_EVERY", "1"))  # compute WavLM loss every N G updates
     # Style cap ramp
     STYLE_CAP_FINAL  = int(os.getenv("STYLE_CAP_FINAL",  "160"))
     STYLE_CAP_WARM   = int(os.getenv("STYLE_CAP_WARM",   "96"))
@@ -166,7 +166,7 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     #Performance improvement
-    nw = min(32, os.cpu_count())
+    nw = min(24, os.cpu_count())
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -175,7 +175,7 @@ def main(config_path):
                                         batch_size=batch_size,
                                         num_workers=nw,
                                         dataset_config=ds_cfg,
-                                        prefetch_factor=32,
+                                        prefetch_factor=16,
                                         persistent_workers=True,
                                         device=device)
 
@@ -187,7 +187,7 @@ def main(config_path):
                                       validation=True,
                                       num_workers=nw,
                                       device=device,
-                                      prefetch_factor=32,
+                                      prefetch_factor=16,
                                       persistent_workers=True,
                                       dataset_config=ds_cfg)
     
@@ -559,6 +559,13 @@ def main(config_path):
                     g_loss = loss_mel
 
                 running_loss += accelerator.gather(loss_mel).mean().item()
+
+                if not torch.isfinite(g_loss):
+                    if accelerator.is_main_process:
+                        log_print(f"[skip] non-finite g_loss; mel={float(loss_mel):.4f}", logger)
+                    optimizer.zero_grad()               # clear any partial grads
+                    _log_free('post_gbwd', iters)
+                    continue
                 # live GA (may have been changed earlier this epoch)
                 acc_steps = accelerator.gradient_accumulation_steps
                 accelerator.backward(g_loss / acc_steps)
@@ -724,6 +731,7 @@ def main(config_path):
         # full-FP32 validation autocast disabled and FP32 retry if needed
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
             iters_test = 0
+            logged_mono_shape = False
             skipped = {"too_short": 0, "silent": 0, "nonfinite_out": 0, "nonfinite_loss": 0}
             
             for batch_idx, batch in enumerate(val_dataloader):
@@ -829,9 +837,20 @@ def main(config_path):
                 s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
 
-                # Optional numeric guard (cheap, avoids rare NaNs from upstream components)
-                F0_real  = torch.nan_to_num(F0_real, nan=0.0, posinf=0.0, neginf=0.0)
-                real_norm = torch.nan_to_num(real_norm, nan=0.0, posinf=0.0, neginf=0.0)
+                # --- sanitize ALL decoder inputs & early-skip on any non-finite ---
+                en       = torch.nan_to_num(en,       nan=0.0, posinf=0.0, neginf=0.0)
+                en_mono  = torch.nan_to_num(en_mono,  nan=0.0, posinf=0.0, neginf=0.0)
+                F0_real  = torch.nan_to_num(F0_real,  nan=0.0, posinf=0.0, neginf=0.0)
+                real_norm= torch.nan_to_num(real_norm,nan=0.0, posinf=0.0, neginf=0.0)
+                # cheap early bail-out if anything is still non-finite
+                if (not torch.isfinite(en).all()
+                    or not torch.isfinite(F0_real).all()
+                    or not torch.isfinite(real_norm).all()
+                    or not torch.isfinite(s).all()):
+                    skipped["nonfinite_out"] += 1
+                    if accelerator.is_main_process:
+                        log_print("[val] decoder inputs non-finite after sanitize; skipping batch", logger)
+                    continue
 
                 y_rec = model.decoder(en.float(), F0_real.float(), real_norm.float(), s)
 
@@ -850,6 +869,10 @@ def main(config_path):
                         # --- NEW: monotonic attention fallback once ---
                         if accelerator.is_main_process:
                             log_print("[val] still non-finite after fp32; trying monotonic attention fallback", logger)
+                            if not logged_mono_shape:
+                                # log shapes to verify the fallback is truly different (and properly transposed)
+                                log_print(f"[val] mono matmul: t_en{tuple(t_en.shape)} @ A{tuple(s2s_attn_mono.shape)} -> en{tuple(en_mono.shape)}", logger)
+                                logged_mono_shape = True
                         y_rec = dec_mod(en_mono.float(), F0_real.float(), real_norm.float(), s.float())
                         if not torch.isfinite(y_rec).all():
                             skipped["nonfinite_out"] += 1
@@ -882,7 +905,7 @@ def main(config_path):
             _log_free('epoch_end', epoch + 1)
             log_print('\n\n\n', logger)
 
-            if epoch % saving_epoch == 0:
+            if (epoch + 1) % saving_epoch == 0:
                 if iters_test > 0 and (val_avg < best_loss):
                     best_loss = val_avg
                 _log_free('pre_save', epoch)

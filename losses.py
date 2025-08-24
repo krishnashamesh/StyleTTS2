@@ -195,45 +195,61 @@ class GeneratorLoss(torch.nn.Module):
         self._mpd_list = getattr(self.mpd, "discriminators", None)
         self._msd_list = getattr(self.msd, "discriminators", None)
 
-    def _split_forward(self, disc_list, y, y_hat):
-        """Run real under inference_mode (bf16) and fake with grads (bf16)."""
-        y_r_list, y_g_list, fmap_r_list, fmap_g_list = [], [], [], []
-        # Real branch — no autograd state (6a)
+    def _split_forward_one(self, d, y, y_hat):
+        """Run a single discriminator: real (no-grad) then fake (with grads)."""
         with torch.inference_mode():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                for d in disc_list:
-                    y_r, fmap_r = d(y)
-                    y_r_list.append(y_r)
-                    fmap_r_list.append(fmap_r)
-        # Fake branch — needs grads for G
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-           for d in disc_list:
+                y_r, fmap_r = d(y)
+
+        # G-step: we don't update D, so don't build weight grads for D.
+        # This keeps gradients flowing to y_hat, but avoids grad state for D's weights.
+        req = []
+        for p in d.parameters():
+            req.append(p.requires_grad)
+            if p.requires_grad:
+                p.requires_grad_(False)
+        try:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 y_g, fmap_g = d(y_hat)
-                y_g_list.append(y_g)
-                fmap_g_list.append(fmap_g)
-        return y_r_list, y_g_list, fmap_r_list, fmap_g_list
+        finally:
+            for p, r in zip(d.parameters(), req):
+                if p.requires_grad != r:
+                    p.requires_grad_(r)
+
+        return y_r, y_g, fmap_r, fmap_g
         
     def forward(self, y, y_hat):
 
-        # Prefer split path (6a); fallback to combined call if unavailable
-        if self._mpd_list is not None and self._msd_list is not None:
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self._split_forward(self._mpd_list, y, y_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self._split_forward(self._msd_list, y, y_hat)
+        total = 0.0
+        # MPD (streamed)
+        if self._mpd_list is not None:
+            for d in self._mpd_list:
+                y_r, y_g, fr, fg = self._split_forward_one(d, y, y_hat)
+                total = total + generator_loss([y_g])[0] \
+                              + generator_TPRLS_loss([y_r], [y_g]) \
+                              + feature_loss([fr], [fg], max_chunks=self.fm_max_chunks)
         else:
-            # Combined call as a safe fallback
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat)
-
-        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g, max_chunks=self.fm_max_chunks)
-        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g, max_chunks=self.fm_max_chunks)
-        loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-        loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-
-        loss_rel = generator_TPRLS_loss(y_df_hat_r, y_df_hat_g) + generator_TPRLS_loss(y_ds_hat_r, y_ds_hat_g)
+            y_r_list, y_g_list, fr_list, fg_list = self.mpd(y, y_hat)
+            total = total + generator_loss(y_g_list)[0] \
+                          + generator_TPRLS_loss(y_r_list, y_g_list) \
+                          + feature_loss(fr_list, fg_list, max_chunks=self.fm_max_chunks)
+        # MSD (streamed)
+        if self._msd_list is not None:
+            # Optional: gate the smallest-hop branch to reduce peak VRAM
+            import os
+            msd_list = self._msd_list[:-1] if os.getenv("MSD_SKIP_LAST","0")=="1" and len(self._msd_list)>1 else self._msd_list
+            for d in msd_list:
+                y_r, y_g, fr, fg = self._split_forward_one(d, y, y_hat)
+                total = total + generator_loss([y_g])[0] \
+                              + generator_TPRLS_loss([y_r], [y_g]) \
+                              + feature_loss([fr], [fg], max_chunks=self.fm_max_chunks)
+        else:
+            y_r_list, y_g_list, fr_list, fg_list = self.msd(y, y_hat)
+            total = total + generator_loss(y_g_list)[0] \
+                          + generator_TPRLS_loss(y_r_list, y_g_list) \
+                          + feature_loss(fr_list, fg_list, max_chunks=self.fm_max_chunks)
         
-        loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_rel
-        
-        return loss_gen_all.mean()
+        return total.mean()
     
 class DiscriminatorLoss(torch.nn.Module):
 

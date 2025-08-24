@@ -66,10 +66,22 @@ class AdaINResBlock1(torch.nn.Module):
     def forward(self, x, s):
         for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
             xt = n1(x, s)
-            xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
+            # --- Snake1D (bf16-safe): keep compute in activation dtype & limit temps ---
+            a1c   = a1.to(dtype=xt.dtype, device=xt.device)
+            inv_a1 = (a1c.abs() + 1e-4).reciprocal()       # avoid 1/0 explosions
+            s1    = torch.sin(a1c * xt)                    # same dtype as xt (bf16 under autocast)
+            s1.square_()                                   # in-place square to avoid an extra tensor
+            xt    = xt + inv_a1 * s1
+
             xt = c1(xt)
             xt = n2(xt, s)
-            xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D
+
+            a2c   = a2.to(dtype=xt.dtype, device=xt.device)
+            inv_a2 = (a2c.abs() + 1e-4).reciprocal()
+            s2    = torch.sin(a2c * xt)
+            s2.square_()
+            xt    = xt + inv_a2 * s2
+
             xt = c2(xt)
             x = xt + x
         return x

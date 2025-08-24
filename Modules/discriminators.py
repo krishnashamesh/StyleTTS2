@@ -19,12 +19,8 @@ def stft(x, fft_size, hop_size, win_length, window):
     Returns:
         Tensor: Magnitude spectrogram (B, #frames, fft_size // 2 + 1).
     """
-    x_stft = torch.stft(x, fft_size, hop_size, win_length, window,
-            return_complex=True)
-    real = x_stft[..., 0]
-    imag = x_stft[..., 1]
-
-    return torch.abs(x_stft).transpose(2, 1)
+    x_stft = torch.stft(x, fft_size, hop_size, win_length, window, return_complex=True)
+    return x_stft.abs().transpose(2, 1)
 
 class SpecDiscriminator(nn.Module):
     """docstring for Discriminator."""
@@ -51,10 +47,11 @@ class SpecDiscriminator(nn.Module):
         fmap = []
         y = y.squeeze(1)
         y = stft(y, self.fft_size, self.shift_size, self.win_length, self.window.to(y.device))
-        y = y.unsqueeze(1)
+        # NHWC activations reduce workspace needs on Ada/Lovelace
+        y = y.unsqueeze(1).contiguous(memory_format=torch.channels_last)
         for i, d in enumerate(self.discriminators):
             y = d(y)
-            y = F.leaky_relu(y, LRELU_SLOPE)
+            y = F.leaky_relu(y, LRELU_SLOPE, inplace=True)
             fmap.append(y)
 
         y = self.out(y)
@@ -117,10 +114,11 @@ class DiscriminatorP(torch.nn.Module):
             x = F.pad(x, (0, n_pad), "reflect")
             t = t + n_pad
         x = x.view(b, c, t // self.period, self.period)
+        x = x.contiguous(memory_format=torch.channels_last)
 
         for l in self.convs:
             x = l(x)
-            x = F.leaky_relu(x, LRELU_SLOPE)
+            x = F.leaky_relu(x, LRELU_SLOPE, inplace=True)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -180,7 +178,7 @@ class WavLMDiscriminator(nn.Module):
         fmap = []
         for l in self.convs:
             x = l(x)
-            x = F.leaky_relu(x, LRELU_SLOPE)
+            x = F.leaky_relu(x, LRELU_SLOPE, inplace=True)
             fmap.append(x)
         x = self.conv_post(x)
         x = torch.flatten(x, 1, -1)
