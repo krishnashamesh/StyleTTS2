@@ -60,6 +60,7 @@ def main(config_path):
     config = yaml.safe_load(open(config_path))
 
     log_dir = config['log_dir']
+    os.makedirs(log_dir, exist_ok=True)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -118,7 +119,40 @@ def main(config_path):
     torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
     torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
 
+    # ----------------------------
+    # Precision / AMP from config
+    # ----------------------------
+    prec = get_precision_cfg(config)
+    # If autocast disabled or mode==fp32, don't let Accelerate cast weights
+    _mp = ("no" if (prec.mode == "fp32" or not prec.use_autocast) else prec.mode)
+
+    # Accelerator init with selected mixed precision
+    accelerator = Accelerator(
+        project_dir=log_dir,
+        split_batches=False,
+        kwargs_handlers=[ddp_kwargs],
+        device_placement=True,
+        gradient_accumulation_steps=grad_accum,
+        mixed_precision=_mp
+    )
+
+    # TF32 only meaningful when running FP32 paths
+    torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
+    torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
+
     torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("highest")
+
+    # --- Startup banner: print precision + env at the very beginning ---
+    try:
+        prec_cfg = get_precision_cfg(config)  # from utils.py
+    except Exception:
+        prec_cfg = Munch(mode="bf16", use_autocast=True, validate_in_fp32=True, tf32=True)
+    if accelerator.is_main_process:
+        try:
+            startup_log(accelerator, prec_cfg, config, logger)  # from utils.py
+        except Exception as _e:
+            log_print(f"[startup] banner failed: {_e}", logger)
     torch.set_float32_matmul_precision("highest")
 
     # --- Startup banner: print precision + env at the very beginning ---
@@ -193,7 +227,7 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     #Performance improvement
-    nw = min(24, os.cpu_count())
+    nw = min(32, os.cpu_count())
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -297,7 +331,9 @@ def main(config_path):
         @torch.no_grad()
         def update(self):
             for k, p in self.m.state_dict().items():
-                self.shadow[k].mul_(self.decay).add_(p.detach().to("cpu", dtype=torch.float32), alpha=1.0 - self.decay)
+                pc = p.detach().to("cpu", dtype=torch.float32)
+                pc = torch.nan_to_num(pc, nan=0.0, posinf=0.0, neginf=0.0)  # sanitize
+                self.shadow[k].mul_(self.decay).add_(pc, alpha=1.0 - self.decay)
         @torch.no_grad()
         def apply_to(self):
             self.backup = {k: p.detach().clone() for k,p in self.m.state_dict().items()}
@@ -308,6 +344,12 @@ def main(config_path):
             if self.backup is not None:
                 self.m.load_state_dict(self.backup, strict=False)
                 self.backup = None
+      
+    def _ema_is_finite(module):
+        for v in module.state_dict().values():
+            if not torch.isfinite(v).all():
+                return False
+        return True
 
     def _unwrap(m):
         return m.module if hasattr(m, "module") else m
@@ -363,6 +405,15 @@ def main(config_path):
             amp_enabled=prec.use_autocast
         ).to(device)
 
+
+    gl = GeneratorLoss(
+            accelerator.unwrap_model(model.mpd),
+            accelerator.unwrap_model(model.msd),
+            fm_max_chunks=fm_chunks,
+            amp_mode=prec.mode,
+            amp_enabled=prec.use_autocast
+        ).to(device)
+
     dl = DiscriminatorLoss(accelerator.unwrap_model(model.mpd),
                            accelerator.unwrap_model(model.msd)).to(device)
     wl = WavLMLoss(model_params.slm.model, 
@@ -400,6 +451,12 @@ def main(config_path):
             log_interval = cadence
             if accelerator.is_main_process:
                 log_print(f"[log] log_interval -> {log_interval} (aligned to D cadence)", logger)
+
+        for name in ["decoder","text_encoder","style_encoder"]:
+            if not _ema_is_finite(ema[name].m):
+                log_print(f"[ema] reset shadow from live weights: {name}", logger)
+                ema[name].shadow = {k: p.detach().to("cpu", dtype=torch.float32).clone()
+                                    for k,p in ema[name].m.state_dict().items()}
 
         _ = [model[key].train() for key in model]
 
@@ -556,7 +613,7 @@ def main(config_path):
                 # strong numeric guard — skip batch if non-finite
                 if not torch.isfinite(loss_mel):
                     if accelerator.is_main_process:
-                        log_print(f"[val] non-finite loss_mel={loss_mel.item()} — skipping batch", logger)
+                        log_print(f"[train] non-finite loss_mel={loss_mel.item()} — skipping batch", logger)
                     continue
 
                 if epoch >= TMA_epoch:  # start TMA training
@@ -667,6 +724,8 @@ def main(config_path):
                     if do_d_update:
                         # D forward in selected AMP context (or fp32)
                         with amp_context(prec.mode, prec.use_autocast):
+                        # D forward in selected AMP context (or fp32)
+                        with amp_context(prec.mode, prec.use_autocast):
                             d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean()
                         d_loss_fp32 = d_loss.float()
                         accelerator.backward(d_loss_fp32 / acc_steps)
@@ -755,13 +814,20 @@ def main(config_path):
 
         _ = [model[key].eval() for key in model]
 
-        # log_print("Crossed Epoch Run", logger)
-
         effective_max_len = 160 if (epoch < TMA_epoch + 2) else max_len
 
         # Swap in EMA weights for evaluation (restore after all eval/saving)
         for _k in ema: ema[_k].apply_to()
         _log_free('pre_val', epoch)
+
+        ema_ok = (_ema_is_finite(ema["decoder"].m)
+                and _ema_is_finite(ema["text_encoder"].m)
+                and _ema_is_finite(ema["style_encoder"].m))
+
+        if not ema_ok:
+            if accelerator.is_main_process:
+                log_print("[ema] shadow contains non-finite values; skipping EMA for this validation", logger)
+            for _k in ema: ema[_k].restore()  # go back to live weights for val
 
         # Validation: force FP32 when requested (default), else follow AMP mode
         _val_amp_enabled = (not bool(prec.validate_in_fp32)) and bool(prec.use_autocast) and prec.mode != "fp32"
@@ -772,8 +838,6 @@ def main(config_path):
             skipped = {"too_short": 0, "silent": 0, "nonfinite_out": 0, "nonfinite_loss": 0}
             
             for batch_idx, batch in enumerate(val_dataloader):
-                optimizer.zero_grad()
-
                 waves = batch[0]
                 batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                 texts, input_lengths, _, _, mels, mel_input_length, _ = batch
