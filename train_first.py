@@ -60,6 +60,12 @@ def main(config_path):
     config = yaml.safe_load(open(config_path))
 
     log_dir = config['log_dir']
+
+    # write logs
+    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
+    logger.logger.addHandler(file_handler)
     
     _redirect_io(log_dir)
     _print_last_oom()
@@ -91,13 +97,40 @@ def main(config_path):
     batch_size = config.get('batch_size', 10)
     grad_accum = config.get('grad_accum', 4)
     
-    #Turn on mixed precision + TF32
-    accelerator = Accelerator(project_dir=log_dir, split_batches=False, kwargs_handlers=[ddp_kwargs],
-                    device_placement=True, gradient_accumulation_steps=grad_accum, mixed_precision="bf16")    
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    # ----------------------------
+    # Precision / AMP from config
+    # ----------------------------
+    prec = get_precision_cfg(config)
+    # If autocast disabled or mode==fp32, don't let Accelerate cast weights
+    _mp = ("no" if (prec.mode == "fp32" or not prec.use_autocast) else prec.mode)
+
+    # Accelerator init with selected mixed precision
+    accelerator = Accelerator(
+        project_dir=log_dir,
+        split_batches=False,
+        kwargs_handlers=[ddp_kwargs],
+        device_placement=True,
+        gradient_accumulation_steps=grad_accum,
+        mixed_precision=_mp
+    )
+
+    # TF32 only meaningful when running FP32 paths
+    torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
+    torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
+
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest")
+
+    # --- Startup banner: print precision + env at the very beginning ---
+    try:
+        prec_cfg = get_precision_cfg(config)  # from utils.py
+    except Exception:
+        prec_cfg = Munch(mode="bf16", use_autocast=True, validate_in_fp32=True, tf32=True)
+    if accelerator.is_main_process:
+        try:
+            startup_log(accelerator, prec_cfg, config, logger)  # from utils.py
+        except Exception as _e:
+            log_print(f"[startup] banner failed: {_e}", logger)
 
     # ---- Adaptive GA: start high, drop on low headroom ----
     BASE_GA = int(grad_accum)
@@ -133,12 +166,6 @@ def main(config_path):
     # Curriculum warmup (fraction of total epochs) and start factor
     CURRIC_WARM_FRAC = float(os.getenv("CURRIC_WARM_FRAC", "0.10"))
     CURRIC_START     = float(os.getenv("CURRIC_START",     "0.90"))
-
-    # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
-    logger.logger.addHandler(file_handler)
     
 
     device = accelerator.device
@@ -327,8 +354,15 @@ def main(config_path):
     # losses: pass UNWRAPPED D modules to avoid Accelerate's fp32 output conversion (6b)
     stft_loss = MultiResolutionSTFTLoss().to(device)
     fm_chunks = int(config.get("fm_max_chunks", 8))
-    gl = GeneratorLoss(accelerator.unwrap_model(model.mpd),
-                       accelerator.unwrap_model(model.msd), fm_max_chunks=fm_chunks).to(device)
+
+    gl = GeneratorLoss(
+            accelerator.unwrap_model(model.mpd),
+            accelerator.unwrap_model(model.msd),
+            fm_max_chunks=fm_chunks,
+            amp_mode=prec.mode,
+            amp_enabled=prec.use_autocast
+        ).to(device)
+
     dl = DiscriminatorLoss(accelerator.unwrap_model(model.mpd),
                            accelerator.unwrap_model(model.msd)).to(device)
     wl = WavLMLoss(model_params.slm.model, 
@@ -631,7 +665,8 @@ def main(config_path):
                     do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
                     log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
                     if do_d_update:
-                        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        # D forward in selected AMP context (or fp32)
+                        with amp_context(prec.mode, prec.use_autocast):
                             d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean()
                         d_loss_fp32 = d_loss.float()
                         accelerator.backward(d_loss_fp32 / acc_steps)
@@ -728,8 +763,10 @@ def main(config_path):
         for _k in ema: ema[_k].apply_to()
         _log_free('pre_val', epoch)
 
-        # full-FP32 validation autocast disabled and FP32 retry if needed
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+        # Validation: force FP32 when requested (default), else follow AMP mode
+        _val_amp_enabled = (not bool(prec.validate_in_fp32)) and bool(prec.use_autocast) and prec.mode != "fp32"
+        _val_dtype = (torch.float16 if prec.mode == "fp16" else torch.bfloat16)
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=_val_amp_enabled, dtype=_val_dtype if _val_amp_enabled else None):
             iters_test = 0
             logged_mono_shape = False
             skipped = {"too_short": 0, "silent": 0, "nonfinite_out": 0, "nonfinite_loss": 0}

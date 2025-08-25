@@ -5,15 +5,15 @@ log_interval: 10
 device: "cuda"
 epochs_1st: 5 # number of epochs for first stage training (pre-training)
 epochs_2nd: 4 # number of epochs for second stage training (joint training)
-batch_size: 3
-grad_accum: 2
+batch_size: 2
+grad_accum: 1
 ga_max: 4
-ga_min: 2
+ga_min: 1
 ga_start_high_pct: 100.0
 ga_free_low_pct: 30.0
 ga_free_high_pct: 40.0
-ga_grow_patience: 2
-ga_grow_cooldown: 3
+ga_grow_patience: 4
+ga_grow_cooldown: 6
 fm_max_chunks: 64
 max_len: 1000 # maximum number of frames (10 seconds)
 pretrained_model: ""
@@ -25,6 +25,12 @@ F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"
 ASR_path: "Utils/ASR/epoch_00080.pth"
 PLBERT_dir: 'Utils/PLBERT/'
+
+precision:
+  mode: fp32        # one of: fp32 | bf16 | fp16
+  use_autocast: false        # if false → force full-fp32, no AMP
+  validate_in_fp32: true    # run validation strictly in fp32 even if training mixed
+  tf32: false                # allow TF32 for matmuls when in fp32 mode
 
 data_params:
   train_data: "Data/train_list.txt"

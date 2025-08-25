@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torchaudio
 from transformers import AutoModel
+from contextlib import nullcontext
 
 class SpectralConvergengeLoss(torch.nn.Module):
     """Spectral convergence loss module."""
@@ -185,20 +186,31 @@ def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
 
 class GeneratorLoss(torch.nn.Module):
 
-    def __init__(self, mpd, msd, fm_max_chunks: int = 8):
+    def __init__(self, mpd, msd, fm_max_chunks: int = 8,
+                 amp_mode: str = "bf16", amp_enabled: bool = True):
         super(GeneratorLoss, self).__init__()
         # UNWRAPPED modules are passed in from train_first.py (6b)
         self.mpd = mpd
         self.msd = msd
         self.fm_max_chunks = int(fm_max_chunks)
+        self.amp_mode = str(amp_mode).lower()
+        self.amp_enabled = bool(amp_enabled)
         # Best effort: many HifiGAN-style Ds expose a 'discriminators' list
         self._mpd_list = getattr(self.mpd, "discriminators", None)
         self._msd_list = getattr(self.msd, "discriminators", None)
 
+    def _amp_ctx(self):
+        if (not self.amp_enabled) or self.amp_mode == "fp32":
+            return nullcontext()
+        return torch.cuda.amp.autocast(
+            dtype=(torch.float16 if self.amp_mode == "fp16" else torch.bfloat16)
+        )
+
+
     def _split_forward_one(self, d, y, y_hat):
         """Run a single discriminator: real (no-grad) then fake (with grads)."""
         with torch.inference_mode():
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with self._amp_ctx():
                 y_r, fmap_r = d(y)
 
         # G-step: we don't update D, so don't build weight grads for D.
@@ -209,7 +221,7 @@ class GeneratorLoss(torch.nn.Module):
             if p.requires_grad:
                 p.requires_grad_(False)
         try:
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with self._amp_ctx():
                 y_g, fmap_g = d(y_hat)
         finally:
             for p, r in zip(d.parameters(), req):
