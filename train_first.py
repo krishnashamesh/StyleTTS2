@@ -118,41 +118,7 @@ def main(config_path):
     # TF32 only meaningful when running FP32 paths
     torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
     torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
-
-    # ----------------------------
-    # Precision / AMP from config
-    # ----------------------------
-    prec = get_precision_cfg(config)
-    # If autocast disabled or mode==fp32, don't let Accelerate cast weights
-    _mp = ("no" if (prec.mode == "fp32" or not prec.use_autocast) else prec.mode)
-
-    # Accelerator init with selected mixed precision
-    accelerator = Accelerator(
-        project_dir=log_dir,
-        split_batches=False,
-        kwargs_handlers=[ddp_kwargs],
-        device_placement=True,
-        gradient_accumulation_steps=grad_accum,
-        mixed_precision=_mp
-    )
-
-    # TF32 only meaningful when running FP32 paths
-    torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
-    torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
-
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("highest")
-
-    # --- Startup banner: print precision + env at the very beginning ---
-    try:
-        prec_cfg = get_precision_cfg(config)  # from utils.py
-    except Exception:
-        prec_cfg = Munch(mode="bf16", use_autocast=True, validate_in_fp32=True, tf32=True)
-    if accelerator.is_main_process:
-        try:
-            startup_log(accelerator, prec_cfg, config, logger)  # from utils.py
-        except Exception as _e:
-            log_print(f"[startup] banner failed: {_e}", logger)
     torch.set_float32_matmul_precision("highest")
 
     # --- Startup banner: print precision + env at the very beginning ---
@@ -396,15 +362,6 @@ def main(config_path):
     # losses: pass UNWRAPPED D modules to avoid Accelerate's fp32 output conversion (6b)
     stft_loss = MultiResolutionSTFTLoss().to(device)
     fm_chunks = int(config.get("fm_max_chunks", 8))
-
-    gl = GeneratorLoss(
-            accelerator.unwrap_model(model.mpd),
-            accelerator.unwrap_model(model.msd),
-            fm_max_chunks=fm_chunks,
-            amp_mode=prec.mode,
-            amp_enabled=prec.use_autocast
-        ).to(device)
-
 
     gl = GeneratorLoss(
             accelerator.unwrap_model(model.mpd),
@@ -722,8 +679,6 @@ def main(config_path):
                     do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
                     log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
                     if do_d_update:
-                        # D forward in selected AMP context (or fp32)
-                        with amp_context(prec.mode, prec.use_autocast):
                         # D forward in selected AMP context (or fp32)
                         with amp_context(prec.mode, prec.use_autocast):
                             d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean()
