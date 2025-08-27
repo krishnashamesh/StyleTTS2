@@ -193,7 +193,7 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     #Performance improvement
-    nw = min(32, os.cpu_count())
+    nw = min(32, os.cpu_count() or 8)
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,

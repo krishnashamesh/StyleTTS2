@@ -1,4 +1,9 @@
 # load packages
+
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+
 import random
 import yaml
 import time
@@ -14,7 +19,11 @@ import shutil
 import traceback
 import warnings
 warnings.simplefilter('ignore')
-from torch.utils.tensorboard import SummaryWriter
+
+import copy
+import os.path as osp
+from datetime import timedelta
+import psutil
 
 from meldataset import build_dataloader
 
@@ -23,6 +32,8 @@ from Utils.JDC.model import JDCNet
 from Utils.PLBERT.util import load_plbert
 
 import atexit, faulthandler, signal, sys, os, time, threading, subprocess, logging
+import math
+import gc
 
 from models import *
 from losses import *
@@ -53,13 +64,25 @@ handler = StreamHandler()
 handler.setLevel(logging.INFO)
 logger.addHandler(handler)
 
+def _scalar(x):
+    try:
+        import torch
+        if torch.is_tensor(x):
+            return x.detach().float().mean().item()
+    except Exception:
+        pass
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
 
 import os, psutil, time, torch
 from datetime import timedelta
 
 def log_metrics(phase: str, step: int, total: int,
                 metrics: dict,
-                logger, writer=None, global_step=None,
+                logger, global_step=None,
                 batch_time=None, mem_gb=None, lr=None):
     """
     Pretty-prints and (optionally) TensorBoards a metrics dict.
@@ -82,9 +105,6 @@ def log_metrics(phase: str, step: int, total: int,
         msg += " | " + " ".join(extras)
     logger.info(msg)
 
-    if writer is not None and global_step is not None:
-        for k, v in metrics.items():
-            writer.add_scalar(f"{phase}/{k}", v, global_step)
 
 
 def current_mem_gb():
@@ -92,6 +112,95 @@ def current_mem_gb():
         return torch.cuda.memory_reserved() / 1e9
     # fall back to resident set size on CPU
     return psutil.Process(os.getpid()).memory_info().rss / 1e9
+
+# --- simple mem logger using torch.cuda.mem_get_info() ---
+def _log_free(tag: str):
+    if torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_pct = (free_b / max(1, total_b)) * 100.0
+        logger.info(f"[mem] {tag}: free={free_b/1e9:.2f}GB ({free_pct:.1f}%)")
+
+# --- targeted allocator trim points for cudaMallocAsync ---
+def _trim_cache(tag: str):
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            logger.info(f"[alloc] trim -> empty_cache() ({tag})")
+    except Exception as _e:
+        logger.info(f"[alloc] trim failed: {_e}")
+
+# ---- LR scale hook is bound after optimizers are built ----
+_base_lrs = None
+def _apply_lr_scale(optimizer, scale: float):
+    if _base_lrs is None:
+        return
+    for name, opt in optimizer.optimizers.items():
+        blrs = _base_lrs[name]
+        for pg, blr in zip(opt.param_groups, blrs):
+            pg["lr"] = float(blr) * float(scale)
+
+
+# -----------------------------
+# EMA & GA utilities
+# -----------------------------
+def _unwrap(m):
+    return m.module if isinstance(m, (torch.nn.DataParallel, MyDataParallel)) else m
+
+def _get_diffusion_core(model_dict):
+    """
+    Returns the *EDM core* that has .sigma_data and is callable as the diffusion loss.
+    Works both when wrapped in DP and when not.
+    """
+    diff = model_dict["diffusion"]
+    diff = getattr(diff, "module", diff)                 # unwrap DP if present
+    return getattr(diff, "diffusion", diff)              # get inner .diffusion if present
+
+def _named_params(module):
+    for n, p in _unwrap(module).named_parameters():
+        if p.requires_grad:
+            yield n, p
+
+class EMAStore:
+    def __init__(self, model_dict, modules, decay=0.999, device=None):
+        self.decay = decay
+        self.targets = [k for k in modules if k in model_dict]
+        self.shadow = {}
+        for k in self.targets:
+            self.shadow[k] = {n: p.detach().clone()
+                              for n, p in _named_params(model_dict[k])}
+        self.device = device
+        logger.info(f"[ema] init: modules={self.targets} decay={decay}")
+
+    @torch.no_grad()
+    def update(self, model_dict):
+        for k in self.targets:
+            mod = model_dict[k]
+            for n, p in _named_params(mod):
+                s = self.shadow[k][n]
+                s.mul_(self.decay).add_(p.detach(), alpha=(1.0 - self.decay))
+
+    @torch.no_grad()
+    def swap_in(self, model_dict):
+        """Load EMA weights into live modules; return backups to restore() later."""
+        backups = {}
+        for k in self.targets:
+            mod = _unwrap(model_dict[k])
+            backups[k] = {n: p.detach().clone() for n, p in mod.named_parameters() if p.requires_grad}
+            for n, p in mod.named_parameters():
+                if p.requires_grad:
+                    p.copy_(self.shadow[k][n])
+        logger.info(f"[ema] swapped IN for eval")
+        return backups
+
+    @torch.no_grad()
+    def restore(self, model_dict, backups):
+        for k, sd in backups.items():
+            mod = _unwrap(model_dict[k])
+            for n, p in mod.named_parameters():
+                if p.requires_grad:
+                    p.copy_(sd[n])
+        logger.info(f"[ema] restored original weights")
 
 
 @click.command()
@@ -109,7 +218,6 @@ def main(config_path):
     _install_signal_handlers(logger)
 
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
-    writer = SummaryWriter(log_dir + "/tensorboard")
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -120,12 +228,20 @@ def main(config_path):
     
     # log_print(f"Config: {config}", logger)
 
-    batch_size = config.get('batch_size', 10)    
+    batch_size = config.get('batch_size', 10)
+    grad_accum = int(config.get('grad_accum', 4))    
 
-    epochs = config.get('epochs_2nd', 200)
+    # Stage-2 must use epochs_2nd (fallback to 'epochs' for safety)
+    epochs = int(config.get('epochs_2nd', config.get('epochs', 0)))
+    if epochs <= 0:
+        logger.error(f"[exit] epochs_2nd/epochs not set (>0). epochs={epochs}. Nothing to do.")
+        return
+
     save_freq = config.get('save_freq', 2)
-    log_interval = config.get('log_interval', 10)
+    log_interval = int(config.get('log_interval', 10))
     saving_epoch = config.get('save_freq', 2)
+
+    logger.info(f"[cfg] log_interval={log_interval}")
 
     data_params = config.get('data_params', None)
     sr = config['preprocess_params'].get('sr', 24000)
@@ -143,28 +259,48 @@ def main(config_path):
     
     optimizer_params = Munch(config['optimizer_params'])
     
+    t0 = time.time()
     train_list, val_list = get_data_path_list(train_path, val_path)
+    logger.info(f"[data] train items={len(train_list)} val items={len(val_list)}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache(); 
+        gc.collect()
+        _log_free("init")
 
-    train_dataloader = build_dataloader(train_list,
-                                        root_path,
-                                        OOD_data=OOD_data,
-                                        min_length=min_length,
-                                        batch_size=batch_size,
-                                        num_workers=2,
-                                        dataset_config={},
-                                        device=device)
+    # Use CPU as much as possible
+    mel_cache_dir = (data_params or {}).get("mel_cache_dir")
+    ds_cfg = {"mel_cache_dir": mel_cache_dir} if mel_cache_dir else {}
+    nw = min(32, os.cpu_count() or 8)
 
-    val_dataloader = build_dataloader(val_list,
-                                      root_path,
-                                      OOD_data=OOD_data,
-                                      min_length=min_length,
-                                      batch_size=batch_size,
-                                      validation=True,
-                                      num_workers=0,
-                                      device=device,
-                                      dataset_config={})
+    logger.info("[data] building train dataloader")
+    train_dataloader = build_dataloader(
+        train_list, root_path,
+        OOD_data=OOD_data, min_length=min_length,
+        batch_size=batch_size,
+        num_workers=nw,
+        prefetch_factor=16,
+        persistent_workers=True,
+        dataset_config=ds_cfg,
+        device=device
+    )
+
+    logger.info("[data] building val dataloader")
+    val_dataloader = build_dataloader(
+        val_list, root_path,
+        OOD_data=OOD_data, min_length=min_length,
+        batch_size=batch_size,
+        validation=True,
+        num_workers=nw,
+        prefetch_factor=8,
+        persistent_workers=True,
+        dataset_config=ds_cfg,
+        device=device
+    )
     
+    logger.info(f"[data] dataloaders ready in {time.time()-t0:.1f}s (workers={nw})")
+
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
     ASR_path = config.get('ASR_path', False)
@@ -181,14 +317,71 @@ def main(config_path):
     # build model
     model_params = recursive_munch(config['model_params'])
     multispeaker = model_params.multispeaker
+
+    t1 = time.time()
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
-    _ = [model[key].to(device) for key in model]
+    logger.info(f"[build] model dict keys: {list(model.keys())}")
+
+    _ = [model[key].to(device, non_blocking=True) for key in model]
+    # param counts
+    _pc = {k: sum(p.numel() for p in _unwrap(model[k]).parameters()) for k in model}
+    logger.info(f"[build] params (M): " + ", ".join(f"{k}:{v/1e6:.2f}" for k,v in _pc.items()))
+    logger.info(f"[build] move+flatten done in {time.time()-t1:.1f}s")
+
+    # Optional: channels_last on decoder (helps memory BW)
+    if bool(config.get("decoder_channels_last", False)):
+        try:
+            dec = getattr(model["decoder"], "module", model["decoder"])
+            dec.to(memory_format=torch.channels_last)
+            logger.info("[channels_last] applied to decoder")
+        except Exception as e:
+            logger.info(f"[warn] channels_last not applied: {e}")
     
-    # DP
-    for key in model:
-        if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
-            
+    # DP OFF by default for a stable baseline; enable with STYLETTS2_USE_DP=1
+    USE_DP = bool(int(os.getenv("STYLETTS2_USE_DP", "0")))
+    if USE_DP:
+        for key in model:
+            if key not in ("mpd", "msd", "wd"):
+                model[key] = MyDataParallel(model[key])
+        logger.info("[dp] DataParallel enabled")
+    else:
+        logger.info("[dp] DataParallel disabled (baseline)")
+
+    # Refresh cuDNN flat buffers for any RNNs after device moves/wrapping
+    def _flatten_rnns(mod):
+        for m in mod.modules():
+            if isinstance(m, (nn.LSTM, nn.GRU, nn.RNN)):
+                try:
+                    m.flatten_parameters()
+                except Exception:
+                    pass
+    for k in ("predictor", "bert_encoder", "decoder", "style_encoder", "text_encoder"):
+        if k in model:
+            _flatten_rnns(getattr(model, k) if hasattr(model, k) else model[k])
+
+
+    # ---- EMA & GA configs ----
+    ema_cfg = Munch(config.get("ema", {
+        "enable": True, "decay": 0.999, "modules": ["decoder","style_encoder","predictor","predictor_encoder"],
+        "start_epoch": 0, "eval": True, "update_freq": 1
+    }))
+    logger.info(f"[cfg] EMA: enable={ema_cfg.enable} modules={ema_cfg.modules} decay={ema_cfg.decay} start_epoch={ema_cfg.start_epoch} eval_on_val={ema_cfg.eval}")
+
+    # ---- Adaptive GA (Stage-1 parity) ----
+    BASE_GA = int(grad_accum)
+    GA_MAX  = int(config.get("ga_max", 8))
+    GA_MIN  = int(config.get("ga_min", 2))
+    GA_START_HIGH_PCT = float(config.get("ga_start_high_pct", 140.0))  # e.g., 4 -> 6
+    FREE_LOW_PCT      = float(config.get("ga_free_low_pct",   8.0))    # drop when below
+    FREE_HIGH_PCT     = float(config.get("ga_free_high_pct", 18.0))    # rise when above (after patience)
+    GA_GROW_PATIENCE  = int  (config.get("ga_grow_patience",  3))
+    GA_GROW_COOLDOWN  = int  (config.get("ga_grow_cooldown",  4))
+    start_ga = max(GA_MIN, min(GA_MAX, int(math.ceil(BASE_GA * GA_START_HIGH_PCT / 100.0))))
+    D_UPDATE_EVERY    = int(os.getenv("D_UPDATE_EVERY", "1"))
+    logger.info(f"[cfg] GA: base={BASE_GA} start={start_ga} range=[{GA_MIN},{GA_MAX}] "
+                f"low={FREE_LOW_PCT}% high={FREE_HIGH_PCT}% patience={GA_GROW_PATIENCE} cooldown={GA_GROW_COOLDOWN} "
+                f"D_UPDATE_EVERY={D_UPDATE_EVERY}")
+
     start_epoch = 0
     iters = 0
 
@@ -213,7 +406,8 @@ def main(config_path):
         else:
             raise ValueError('You need to specify the path to the first stage model.') 
 
-    gl = GeneratorLoss(model.mpd, model.msd).to(device)
+    fm_chunks = int(config.get("fm_max_chunks", 8))
+    gl = GeneratorLoss(model.mpd, model.msd, fm_max_chunks=fm_chunks).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, 
                    model.wd, 
@@ -223,11 +417,12 @@ def main(config_path):
     gl = MyDataParallel(gl)
     dl = MyDataParallel(dl)
     wl = MyDataParallel(wl)
-    
+        
+    _diff_core = _get_diffusion_core(model)
     sampler = DiffusionSampler(
-        model.diffusion.diffusion,
+        _diff_core,
         sampler=ADPM2Sampler(),
-        sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
+        sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0),
         clamp=False
     )
     
@@ -243,7 +438,14 @@ def main(config_path):
     scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
     
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+                                scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+
+    # Log LR table at epoch 0
+    try:
+        _lr_table = {k: optimizer.optimizers[k].param_groups[0]['lr'] for k in optimizer.optimizers}
+        logger.info("[lr] " + ", ".join(f"{k}:{v:.2e}" for k,v in _lr_table.items()))
+    except Exception:
+        pass
     
     # adjust BERT learning rate
     for g in optimizer.optimizers['bert'].param_groups:
@@ -261,6 +463,12 @@ def main(config_path):
             g['initial_lr'] = optimizer_params.ft_lr
             g['min_lr'] = 0
             g['weight_decay'] = 1e-4
+
+
+    # record base LRs for GA LR scaling (Stage-1 parity)
+    global _base_lrs
+    _base_lrs = {name: [pg["lr"] for pg in opt.param_groups]
+                 for name, opt in optimizer.optimizers.items()}
         
     # load models if there is a model
     if load_pretrained:
@@ -278,8 +486,8 @@ def main(config_path):
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        _log_free("init")
     
-    import gc
     gc.collect()
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
@@ -302,9 +510,41 @@ def main(config_path):
                                )
 
 
+    # ---- EMA store (after all modules exist) ----
+    ema = None
+    if ema_cfg.enable:
+        ema = EMAStore(model, ema_cfg.modules, decay=ema_cfg.decay, device=device)
+
+    # GA state
+    acc_steps = start_ga
+    ga_safe_count = 0
+    ga_cooldown   = GA_GROW_COOLDOWN
+    E_BASE = batch_size * max(1, BASE_GA)
+    ga_bucket = 0
+
+    # Final sanity check before we start loops
+    logger.info(f"[loop] epochs={epochs} start_epoch={start_epoch} steps_per_epoch={len(train_dataloader)}")
+    if start_epoch >= epochs:
+        logger.warning(f"[exit] start_epoch ({start_epoch}) >= epochs ({epochs}). Nothing to train.")
+        return
+
+    logger.info("[train] BEGIN")
     for epoch in range(start_epoch, epochs):
-        running_loss = 0
+        
         start_time = time.time()
+        running_loss = 0
+        last_d_marker = "D-"
+        slm_skips = 0      # true skips after gate opens (e.g., cadence, None from slmadv)
+        slm_gated = 0      # gated steps before epoch >= diff_epoch
+
+        _trim_cache("epoch-start"); 
+        gc.collect()
+
+        # reset GA to start_ga each epoch; scale LR with effective batch
+        acc_steps = start_ga
+        eff_scale = (batch_size * acc_steps) / max(1.0, float(E_BASE))
+        _apply_lr_scale(optimizer, eff_scale)
+        logger.info(f"[ga] epoch-reset -> {acc_steps} (eff_scale={eff_scale:.2f})")
 
         _ = [model[key].eval() for key in model]
 
@@ -315,376 +555,541 @@ def main(config_path):
         model.mpd.train()
 
 
-        if epoch >= diff_epoch:
+        if epoch >= diff_epoch and not start_ds:
+            logger.info(f"[gate] entering diffusion phase at epoch {epoch}")
             start_ds = True
+        if epoch == joint_epoch:
+            logger.info(f"[gate] entering joint fine-tune phase at epoch {epoch}")
+
+        logger.info(f"[epoch {epoch}] start ({len(train_dataloader)} steps)")
+        if epoch < diff_epoch:
+            logger.info(f"[slm-adv] OFF (gated) until epoch >= {diff_epoch} (zero-based). WD will not step; D marker reflects only mpd/msd.")
+        else:
+            logger.info("[slm-adv] ON. WD steps according to D_UPDATE_EVERY and slmadv cadence.")
 
         for i, batch in enumerate(train_dataloader):
-            waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
-            texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
 
-            with torch.no_grad():
-                mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                mel_mask = length_to_mask(mel_input_length).to(device)
-                text_mask = length_to_mask(input_lengths).to(texts.device)
+            # --- lightweight timers for profiling at interval ---
+            import time as _t
+            _t0 = _t.perf_counter()
+            dt_align = dt_text = dt_style = dt_pred = 0.0
+            dt_dec_gt = dt_dec = dt_disc = dt_stft = dt_bwd = 0.0
 
-                try:
-                    _, _, s2s_attn = model.text_aligner(mels, mask, texts)
-                    s2s_attn = s2s_attn.transpose(-1, -2)
-                    s2s_attn = s2s_attn[..., 1:]
-                    s2s_attn = s2s_attn.transpose(-1, -2)
-                except:
+            try:
+                # ---- GA boundary bookkeeping ----
+                if ga_bucket == 0:
+                    # zero ONLY generator-family grads
+                    for k in ("bert_encoder","bert","predictor","predictor_encoder","diffusion","style_encoder","decoder"):
+                        if k in model:
+                            for p in model[k].parameters():
+                                if p.grad is not None: p.grad = None
+                    # also clear D grads if we accumulate their grads for boundary stepping
+                    for k in ("msd","mpd"):
+                        if k in model:
+                            for p in model[k].parameters():
+                                if p.grad is not None: p.grad = None
+                ga_bucket += 1
+                step_boundary = (ga_bucket % max(1, acc_steps) == 0)
+
+                waves = batch[0]
+                batch = [b.to(device, non_blocking=True) for b in batch[1:]]
+                texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+
+                with torch.no_grad():
+                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                    mel_mask = length_to_mask(mel_input_length).to(device)
+                    text_mask = length_to_mask(input_lengths).to(texts.device)
+                    try:
+                        _, _, s2s_attn = model.text_aligner(mels, mask, texts)
+                        dt_align = _t.perf_counter() - _t0; _t1 = _t.perf_counter()
+                        s2s_attn = s2s_attn.transpose(-1, -2)
+                        s2s_attn = s2s_attn[..., 1:]
+                        s2s_attn = s2s_attn.transpose(-1, -2)
+                    except Exception:
+                        continue
+                    # build legal attn mask and sanitize + row-renorm
+                    attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
+                    attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
+                    attn_mask = (attn_mask < 1)
+                    s2s_attn.masked_fill_(attn_mask, 0.0)
+                    s2s_attn = torch.nan_to_num(s2s_attn, 0.0, 0.0, 0.0)
+                    row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    s2s_attn = s2s_attn / row_sum
+                    # monotonic fallback
+                    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn, mask_ST).float()
+                    s2s_attn_mono = torch.nan_to_num(s2s_attn_mono, 0.0, 0.0, 0.0)
+
+                    # encode
+                    t_en = model.text_encoder(texts, input_lengths, text_mask)
+                    dt_text = _t.perf_counter() - _t1; _t2 = _t.perf_counter()
+                    asr = (t_en @ s2s_attn_mono)
+
+                    d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                    
+                    # compute reference styles
+                    if multispeaker and epoch >= diff_epoch:
+                        ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
+                        ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
+                        ref = torch.cat([ref_ss, ref_sp], dim=1)
+
+                # compute the style of the entire utterance
+                # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
+                ss = []
+                gs = []
+                for bib in range(len(mel_input_length)):
+                    mel_length = int(mel_input_length[bib].item())
+                    mel = mels[bib, :, :mel_input_length[bib]]
+                    s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
+                    ss.append(s)
+                    s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
+                    gs.append(s)
+
+                s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
+                gs = torch.stack(gs).squeeze(1) # global acoustic styles
+                s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
+
+                bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
+                d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+                
+                # denoiser training
+                if epoch >= diff_epoch:
+                    num_steps = np.random.randint(3, 5)
+                    
+                    if model_params.diffusion.dist.estimate_sigma_data:
+                        _edm = _get_diffusion_core(model)
+                        sigma_val = s_trg.std(axis=-1).mean().item()
+                        _edm.sigma_data = sigma_val
+                        running_std.append(sigma_val)
+                        
+                    if multispeaker:
+                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                            embedding=bert_dur,
+                            embedding_scale=1,
+                                    features=ref, # reference from the same speaker as the embedding
+                                embedding_mask_proba=0.1,
+                                num_steps=num_steps).squeeze(1)
+                        loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
+                        loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                    else:
+                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                            embedding=bert_dur,
+                            embedding_scale=1,
+                                embedding_mask_proba=0.1,
+                                num_steps=num_steps).squeeze(1)                    
+
+                        _edm = _get_diffusion_core(model)
+                        loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur).mean()
+                        loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                else:
+                    loss_sty = 0
+                    loss_diff = 0
+
+                d, p = model.predictor(d_en, s_dur, 
+                                                        input_lengths, 
+                                                        s2s_attn_mono, 
+                                                        text_mask)
+                
+                mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
+                mel_len_st = int(mel_input_length.min().item() / 2 - 1)
+                en = []
+                gt = []
+                st = []
+                p_en = []
+                
+                wav_cpu = []
+
+                for bib in range(len(mel_input_length)):
+                    mel_length = int(mel_input_length[bib].item() / 2)
+
+                    random_start = np.random.randint(0, mel_length - mel_len)
+                    en.append(asr[bib, :, random_start:random_start+mel_len])
+                    p_en.append(p[bib, :, random_start:random_start+mel_len])
+                    gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
+                    
+                    y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                    wav_cpu.append(torch.from_numpy(y))
+
+                    # style reference (better to be different from the GT)
+                    random_start = np.random.randint(0, mel_length - mel_len_st)
+                    st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
+                    
+                wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+
+                en = torch.stack(en)
+                p_en = torch.stack(p_en)
+                gt = torch.stack(gt).detach()
+                st = torch.stack(st).detach()
+                
+                if gt.size(-1) < 80:
                     continue
 
-                mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
-
-                # encode
-                t_en = model.text_encoder(texts, input_lengths, text_mask)
-                asr = (t_en @ s2s_attn_mono)
-
-                d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                dt_pred = _t.perf_counter() - _t2; _t3 = _t.perf_counter()
+                s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                dt_style = _t.perf_counter() - _t3; _t4 = _t.perf_counter()
+                # sanitize style vectors
+                s = torch.nan_to_num(s, 0.0, 0.0, 0.0)
                 
-                # compute reference styles
-                if multispeaker and epoch >= diff_epoch:
-                    ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
-                    ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref = torch.cat([ref_ss, ref_sp], dim=1)
+                with torch.no_grad():
+                    F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
+                    F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
-            # compute the style of the entire utterance
-            # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-            ss = []
-            gs = []
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item())
-                mel = mels[bib, :, :mel_input_length[bib]]
-                s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                ss.append(s)
-                s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                gs.append(s)
+                    asr_real = model.text_aligner.get_feature(gt)
 
-            s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
-            gs = torch.stack(gs).squeeze(1) # global acoustic styles
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
-
-            bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-            d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-            
-            # denoiser training
-            if epoch >= diff_epoch:
-                num_steps = np.random.randint(3, 5)
-                
-                if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
+                    N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
                     
-                if multispeaker:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                                   features=ref, # reference from the same speaker as the embedding
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)
-                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-                else:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-            else:
-                loss_sty = 0
-                loss_diff = 0
+                    y_rec_gt = wav.unsqueeze(1)
+                    y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+                    dt_dec_gt = _t.perf_counter() - _t4; _t5 = _t.perf_counter()
 
-            d, p = model.predictor(d_en, s_dur, 
-                                                    input_lengths, 
-                                                    s2s_attn_mono, 
-                                                    text_mask)
-            
-            mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
-            mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-            en = []
-            gt = []
-            st = []
-            p_en = []
-            wav = []
+                    if epoch >= joint_epoch:
+                        # ground truth from recording
+                        wav = y_rec_gt # use recording since decoder is tuned
+                    else:
+                        # ground truth from reconstruction
+                        wav = y_rec_gt_pred # use reconstruction since decoder is fixed
 
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item() / 2)
+                F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
 
-                random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start:random_start+mel_len])
-                p_en.append(p[bib, :, random_start:random_start+mel_len])
-                gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                wav.append(torch.from_numpy(y).to(device))
-
-                # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
-                
-            wav = torch.stack(wav).float().detach()
-
-            en = torch.stack(en)
-            p_en = torch.stack(p_en)
-            gt = torch.stack(gt).detach()
-            st = torch.stack(st).detach()
-            
-            if gt.size(-1) < 80:
-                continue
-
-            s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
-            s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
-            
-            with torch.no_grad():
-                F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
-                F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
-
-                asr_real = model.text_aligner.get_feature(gt)
-
-                N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
-                
-                y_rec_gt = wav.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
-
-                if epoch >= joint_epoch:
-                    # ground truth from recording
-                    wav = y_rec_gt # use recording since decoder is tuned
-                else:
-                    # ground truth from reconstruction
-                    wav = y_rec_gt_pred # use reconstruction since decoder is fixed
-
-            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
-
-            y_rec = model.decoder(en, F0_fake, N_fake, s)
-
-            loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
-            loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
-
-            if start_ds:
-                optimizer.zero_grad()
-                d_loss = dl(wav.detach(), y_rec.detach()).mean()
-                d_loss.backward()
-                optimizer.step('msd')
-                optimizer.step('mpd')
-            else:
-                d_loss = 0
-
-            # generator loss
-            optimizer.zero_grad()
-
-            loss_mel = stft_loss(y_rec, wav)
-            if start_ds:
-                loss_gen_all = gl(wav, y_rec).mean()
-            else:
-                loss_gen_all = 0
-            loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
-
-            loss_ce = 0
-            loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
-                _s2s_pred = _s2s_pred[:_text_length, :]
-                _text_input = _text_input[:_text_length].long()
-                _s2s_trg = torch.zeros_like(_s2s_pred)
-                for p in range(_s2s_trg.shape[0]):
-                    _s2s_trg[p, :_text_input[p]] = 1
-                _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-
-                loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                       _text_input[1:_text_length-1])
-                loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
-
-            loss_ce /= texts.size(0)
-            loss_dur /= texts.size(0)
-
-            g_loss = loss_params.lambda_mel * loss_mel + \
-                     loss_params.lambda_F0 * loss_F0_rec + \
-                     loss_params.lambda_ce * loss_ce + \
-                     loss_params.lambda_norm * loss_norm_rec + \
-                     loss_params.lambda_dur * loss_dur + \
-                     loss_params.lambda_gen * loss_gen_all + \
-                     loss_params.lambda_slm * loss_lm + \
-                     loss_params.lambda_sty * loss_sty + \
-                     loss_params.lambda_diff * loss_diff
-
-            running_loss += loss_mel.item()
-            g_loss.backward()
-            if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
-
-            optimizer.step('bert_encoder')
-            optimizer.step('bert')
-            optimizer.step('predictor')
-            optimizer.step('predictor_encoder')
-            
-            if epoch >= diff_epoch:
-                optimizer.step('diffusion')
-            
-            if epoch >= joint_epoch:
-                optimizer.step('style_encoder')
-                optimizer.step('decoder')
-        
-                # randomly pick whether to use in-distribution text
-                if np.random.rand() < 0.5:
-                    use_ind = True
-                else:
-                    use_ind = False
-
-                if use_ind:
-                    ref_lengths = input_lengths
-                    ref_texts = texts
-                    
-                slm_out = slmadv(i, 
-                                 y_rec_gt, 
-                                 y_rec_gt_pred, 
-                                 waves, 
-                                 mel_input_length,
-                                 ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
-
-                if slm_out is None:
+                # sanitize decoder inputs
+                en = torch.nan_to_num(en, 0.0, 0.0, 0.0)
+                F0_fake = torch.nan_to_num(F0_fake, 0.0, 0.0, 0.0)
+                N_fake = torch.nan_to_num(N_fake, 0.0, 0.0, 0.0)
+                y_rec = model.decoder(en, F0_fake, N_fake, s)
+                dt_dec = _t.perf_counter() - _t5; _t6 = _t.perf_counter()
+                if not torch.isfinite(y_rec).all():
+                    logger.info("[train] non-finite decoder output; skipping batch")
                     continue
-                    
-                d_loss_slm, loss_gen_lm, y_pred = slm_out
-                
-                # SLM generator loss
-                optimizer.zero_grad()
-                loss_gen_lm.backward()
 
-                # compute the gradient norm
-                total_norm = {}
-                for key in model.keys():
-                    total_norm[key] = 0
-                    parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
-                    for p in parameters:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm[key] += param_norm.item() ** 2
-                    total_norm[key] = total_norm[key] ** 0.5
+                loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
+                loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
-                # gradient scaling
-                if total_norm['predictor'] > slmadv_params.thresh:
+                # -------- Discriminator path (accumulate; step at boundary) --------
+                d_loss = 0.0
+                if start_ds:
+                    d_loss = dl(wav.detach(), y_rec.detach()).mean()
+                    (d_loss / max(1, acc_steps)).backward()
+                    dt_disc = _t.perf_counter() - _t6; _t7 = _t.perf_counter()
+                else:
+                    d_loss = 0.0
+
+                # -------- Generator losses (accumulate) --------
+
+                loss_mel = stft_loss(y_rec.float(), wav.float())
+                dt_stft = _t.perf_counter() - _t7 if start_ds else _t.perf_counter() - _t6
+
+                if start_ds:
+                    loss_gen_all = gl(wav, y_rec).mean()
+                else:
+                    loss_gen_all = 0
+                loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+
+                loss_ce = 0
+                loss_dur = 0
+                for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
+                    _s2s_pred = _s2s_pred[:_text_length, :]
+                    _text_input = _text_input[:_text_length].long()
+                    _s2s_trg = torch.zeros_like(_s2s_pred)
+                    for p in range(_s2s_trg.shape[0]):
+                        _s2s_trg[p, :_text_input[p]] = 1
+                    _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
+
+                    loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
+                                        _text_input[1:_text_length-1])
+                    loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
+
+                loss_ce /= texts.size(0)
+                loss_dur /= texts.size(0)
+
+                g_loss = loss_params.lambda_mel * loss_mel + \
+                        loss_params.lambda_F0 * loss_F0_rec + \
+                        loss_params.lambda_ce * loss_ce + \
+                        loss_params.lambda_norm * loss_norm_rec + \
+                        loss_params.lambda_dur * loss_dur + \
+                        loss_params.lambda_gen * loss_gen_all + \
+                        loss_params.lambda_slm * loss_lm + \
+                        loss_params.lambda_sty * loss_sty + \
+                        loss_params.lambda_diff * loss_diff
+
+                running_loss += loss_mel.item()
+                (g_loss / max(1, acc_steps)).backward()
+                dt_bwd = _t.perf_counter() - (_t7 if start_ds else _t6)
+
+                if torch.isnan(g_loss):
+                    from IPython.core.debugger import set_trace
+                    set_trace()
+
+                # -------- Step at GA boundary --------
+                if step_boundary:
+                    # D cadence (optional reduction)
+                    do_d_update = ((i // max(1, acc_steps)) % max(1, D_UPDATE_EVERY) == 0)
+                    if start_ds and do_d_update:
+                        optimizer.step('msd'); 
+                        optimizer.step('mpd')
+                        last_d_marker = "D+"
+                    else:
+                        last_d_marker = "D-"
+                    # G family
+                    optimizer.step('bert_encoder'); optimizer.step('bert')
+                    optimizer.step('predictor');    optimizer.step('predictor_encoder')
+                    if epoch >= diff_epoch and 'diffusion' in optimizer.optimizers:
+                        optimizer.step('diffusion')
+                    if epoch >= joint_epoch:
+                        optimizer.step('style_encoder'); optimizer.step('decoder')
+                        # mark D and print a compact step map
+                        last_d_marker = "D+" if (start_ds and do_d_update) else "D-"
+                        _stepped = {
+                            "msd": (start_ds and do_d_update),
+                            "mpd": (start_ds and do_d_update),
+                            "bert": True, "bert_enc": True,
+                            "pred": True, "pred_enc": True,
+                            "diff": (epoch >= diff_epoch and 'diffusion' in optimizer.optimizers),
+                            "style": (epoch >= joint_epoch),
+                            "dec": (epoch >= joint_epoch)
+                        }
+                        logger.info("[step] " + " ".join(f"{k}:{'+' if v else '-'}" for k,v in _stepped.items()))
+
+                    # EMA update after real steps
+                    if ema and epoch >= ema_cfg.start_epoch and ((i // max(1, acc_steps)) % max(1, ema_cfg.update_freq) == 0):
+                        ema.update(model)
+                    # ---- GA headroom tuning ----
+                    if torch.cuda.is_available():
+                        free_b, total_b = torch.cuda.mem_get_info()
+                        free_pct = (free_b / max(1, total_b)) * 100.0
+                        logger.info(f"[mem] boundary: free={free_b/1e9:.2f}GB ({free_pct:.1f}%), ga={acc_steps}")
+                        # cooldown ticks down each boundary
+                        if ga_cooldown > 0: ga_cooldown -= 1
+                        # DROP when headroom low
+                        if free_pct < FREE_LOW_PCT and acc_steps > GA_MIN:
+                            acc_steps -= 1
+                            eff_scale = (batch_size * acc_steps) / max(1.0, float(E_BASE))
+                            _apply_lr_scale(optimizer, eff_scale)
+                            logger.info(f"[ga] drop -> {acc_steps} (free={free_pct:.1f}%)")
+                            ga_safe_count = 0; ga_cooldown = GA_GROW_COOLDOWN
+                        # RISE when headroom consistently high
+                        elif (free_pct >= FREE_HIGH_PCT and acc_steps < GA_MAX and ga_cooldown == 0):
+                            ga_safe_count += 1
+                            if ga_safe_count >= GA_GROW_PATIENCE:
+                                acc_steps += 1
+                                eff_scale = (batch_size * acc_steps) / max(1.0, float(E_BASE))
+                                _apply_lr_scale(optimizer, eff_scale)
+                                logger.info(f"[ga] rise -> {acc_steps} (free={free_pct:.1f}%, safe={ga_safe_count})")
+                                ga_safe_count = 0; ga_cooldown = GA_GROW_COOLDOWN
+                        else:
+                            if free_pct < FREE_HIGH_PCT: ga_safe_count = 0
+                        # gentle allocator trim when plenty of headroom
+                        if free_pct >= (FREE_HIGH_PCT + 7.0):
+                            torch.cuda.empty_cache()
+                    ga_bucket = 0
+            
+                    # randomly pick whether to use in-distribution text
+                    if np.random.rand() < 0.5:
+                        use_ind = True
+                    else:
+                        use_ind = False
+
+                    if use_ind:
+                        ref_lengths = input_lengths
+                        ref_texts = texts
+                        
+                    slm_out = slmadv(i, 
+                                    y_rec_gt, 
+                                    y_rec_gt_pred, 
+                                    waves, 
+                                    mel_input_length,
+                                    ref_texts, 
+                                    ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+
+                    if slm_out is None:
+                        # stay in the step so logging/heartbeat still prints
+                        if not start_ds:
+                            slm_gated += 1
+                        else:
+                            slm_skips += 1
+                        d_loss_slm, loss_gen_lm, y_pred = 0, 0, None
+                    else:
+                        d_loss_slm, loss_gen_lm, y_pred = slm_out
+                        # SLM generator loss (accumulate; step already handled at boundary)
+                        (loss_gen_lm / max(1, acc_steps)).backward()
+
+                    # compute the gradient norm
+                    total_norm = {}
                     for key in model.keys():
-                        for p in model[key].parameters():
-                            if p.grad is not None:
-                                p.grad *= (1 / total_norm['predictor']) 
+                        total_norm[key] = 0
+                        parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
+                        for p in parameters:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm[key] += param_norm.item() ** 2
+                        total_norm[key] = total_norm[key] ** 0.5
 
-                for p in model.predictor.duration_proj.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
+                    # gradient scaling
+                    if total_norm['predictor'] > slmadv_params.thresh:
+                        for key in model.keys():
+                            for p in model[key].parameters():
+                                if p.grad is not None:
+                                    p.grad *= (1 / total_norm['predictor']) 
 
-                for p in model.predictor.lstm.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
+                    for p in model.predictor.duration_proj.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
 
-                for p in model.diffusion.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
+                    for p in model.predictor.lstm.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
 
-                optimizer.step('bert_encoder')
-                optimizer.step('bert')
-                optimizer.step('predictor')
-                optimizer.step('diffusion')
+                    for p in model.diffusion.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
 
-                # SLM discriminator loss
-                if d_loss_slm != 0:
-                    optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
-                    optimizer.step('wd')
+                    # SLM discriminator loss
+                    if d_loss_slm != 0:
+                        # update WD without clobbering G grads
+                        for p in model['wd'].parameters():
+                            if p.grad is not None: p.grad = None
+                        d_loss_slm.backward(retain_graph=True)
+                        optimizer.step('wd')
 
-            else:
-                d_loss_slm, loss_gen_lm = 0, 0
+                else:
+                    d_loss_slm, loss_gen_lm = 0, 0
+                    
+                iters = iters + 1
                 
-            iters = iters + 1
+                # ─ inside the main train loop ─
+                if i == 0:
+                    # compact early after first successful fwd/bwd
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                if (i + 1) % log_interval == 0:
+                    total = len(train_dataloader)
+                    if not start_ds:
+                        logger.info(f"[slm-adv] gated: {slm_gated}/{total} steps so far (diff_epoch={diff_epoch}, current={epoch})")
+                    else:
+                        logger.info(f"[slm-adv] skipped {slm_skips}/{total} steps ({100.0*slm_skips/total:.1f}%) this epoch")
+                    batch_time = time.time() - start_time
+                    lr_now = optimizer.optimizers['decoder'].param_groups[0]['lr']
+                    _log_free("train-boundary")
+
+                    # --- compact, human-friendly line (train_first.py style) ---
+                    logger.info(
+                        "Epoch [%d/%d], Step [%d/%d], %s | "
+                        "Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, "
+                        "Dur Loss: %.5f, CE Loss: %.5f, SLM Loss: %.5f | "
+                        "GA:%d LR: %.2e"
+                        % (
+                            epoch + 1, epochs,
+                            i + 1, len(train_dataloader),
+                            last_d_marker,
+                            float(running_loss / log_interval),
+                            _scalar(loss_gen_all), _scalar(d_loss),
+                            _scalar(loss_dur), _scalar(loss_ce), _scalar(loss_lm),
+                            acc_steps, lr_now
+                        )
+                    )
+                    logger.info(f"Time elapsed: {batch_time:.2f} seconds")
+
+                    # --- keep the richer metrics line too (optional) ---
+                    log_metrics(
+                        phase='train',
+                        step=i + 1,
+                        total=len(train_dataloader),
+                        metrics={
+                            'mel':   float(running_loss / log_interval),
+                            'disc':  _scalar(d_loss),
+                            'dur':   _scalar(loss_dur),
+                            'ce':    _scalar(loss_ce),
+                            'norm':  _scalar(loss_norm_rec),
+                            'F0':    _scalar(loss_F0_rec),
+                            'lm':    _scalar(loss_lm),
+                            'gen':   _scalar(loss_gen_all),
+                            'sty':   _scalar(loss_sty),
+                            'diff':  _scalar(loss_diff),
+                            'discLM': _scalar(d_loss_slm),
+                            'genLM':  _scalar(loss_gen_lm)
+                        },
+                        logger=logger,
+                        global_step=iters,
+                        batch_time=batch_time,
+                        mem_gb=current_mem_gb(),
+                        lr=lr_now
+                    )
+                    running_loss = 0.0
+
+                # --- Profile the heavy parts at the same cadence (no spam) ---
+                if log_interval > 0 and ((i + 1) % log_interval == 0):
+                    try:
+                        free_b, total_b = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 1)
+                        free_gb = free_b / 1e9; free_pct = (free_b / total_b) * 100.0
+                        logger.info(
+                            "[profile] E%d S%d | align=%.3fs text=%.3fs pred=%.3fs style=%.3fs "
+                            "dec_gt=%.3fs dec=%.3fs D=%.3fs stft=%.3fs bwd=%.3fs | free=%.2fGB (%.1f%%)"
+                            % (epoch, i + 1, dt_align, dt_text, dt_pred, dt_style,
+                            dt_dec_gt, dt_dec, dt_disc, dt_stft, dt_bwd, free_gb, free_pct)
+                        )
+                    except Exception:
+                        pass
             
-            # if (i+1)%log_interval == 0:
-            #     log_print('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
-            #         %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm), logger)
-                
-            #     writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
-            #     writer.add_scalar('train/gen_loss', loss_gen_all, iters)
-            #     writer.add_scalar('train/d_loss', d_loss, iters)
-            #     writer.add_scalar('train/ce_loss', loss_ce, iters)
-            #     writer.add_scalar('train/dur_loss', loss_dur, iters)
-            #     writer.add_scalar('train/slm_loss', loss_lm, iters)
-            #     writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
-            #     writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
-            #     writer.add_scalar('train/sty_loss', loss_sty, iters)
-            #     writer.add_scalar('train/diff_loss', loss_diff, iters)
-            #     writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
-            #     writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
-                
-            #     running_loss = 0
-
-            #     log_print(f"Time elapsed: {time.time() - start_time:.2f} seconds", logger)
-
-            # ─ inside the main train loop ─
-            if (i + 1) % log_interval == 0:
-                batch_time = time.time() - start_time
-                lr_now = optimizer.optimizers['decoder'].param_groups[0]['lr']
-                log_metrics(
-                    phase='train',
-                    step=i + 1,
-                    total=len(train_list) // batch_size,
-                    metrics={
-                        'mel': running_loss / log_interval,
-                        'disc': d_loss.item(),
-                        'dur':  loss_dur.item(),
-                        'ce':   loss_ce.item(),
-                        'norm': loss_norm_rec.item(),
-                        'F0':   loss_F0_rec.item(),
-                        'lm':   loss_lm.item(),
-                        'gen':  loss_gen_all.item(),
-                        'sty':  loss_sty.item(),
-                        'diff': loss_diff.item(),
-                        'discLM': d_loss_slm.item(),
-                        'genLM': loss_gen_lm.item()
-                    },
-                    logger=logger,
-                    writer=writer,
-                    global_step=iters,
-                    batch_time=batch_time,
-                    mem_gb=current_mem_gb(),
-                    lr=lr_now
-                )
-                running_loss = 0.
-                start_time = time.time()          # reset timer
-
+            
+            except torch.cuda.OutOfMemoryError:
+                traceback.print_exc()
+                _trim_cache("OOM"); 
+                gc.collect()
+                if acc_steps > GA_MIN:
+                    acc_steps = max(GA_MIN, acc_steps // 2); ga_bucket = 0
+                    eff_scale = (batch_size * acc_steps) / max(1.0, float(E_BASE))
+                    _apply_lr_scale(optimizer, eff_scale)
+                    logger.info(f"[ga] OOM: halving acc_steps -> {acc_steps}")
+                else:
+                    logger.error("[oom] unrecoverable within GA policy; skipping batch")
+                continue
                 
         loss_test = 0
         loss_align = 0
         loss_f = 0
+
         _ = [model[key].eval() for key in model]
+        ema_backups = None
+        if ema and ema_cfg.eval:
+            ema_backups = ema.swap_in(model)
 
         with torch.no_grad():
             iters_test = 0
             val_start = time.time()
             for batch_idx, batch in enumerate(val_dataloader):
-                optimizer.zero_grad()
                 
                 try:
                     waves = batch[0]
-                    batch = [b.to(device) for b in batch[1:]]
+                    batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
                     with torch.no_grad():
                         mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                        
                         text_mask = length_to_mask(input_lengths).to(texts.device)
-
                         _, _, s2s_attn = model.text_aligner(mels, mask, texts)
+
                         s2s_attn = s2s_attn.transpose(-1, -2)
                         s2s_attn = s2s_attn[..., 1:]
                         s2s_attn = s2s_attn.transpose(-1, -2)
 
+                        # sanitize + row-renorm (Stage-1 parity)
+                        attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
+                        attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
+                        attn_mask = (attn_mask < 1)
+                        s2s_attn.masked_fill_(attn_mask, 0.0)
+                        s2s_attn = torch.nan_to_num(s2s_attn, nan=0.0, posinf=0.0, neginf=0.0)
+                        row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                        s2s_attn = s2s_attn / row_sum
                         mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+
                         s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
                         # encode
                         t_en = model.text_encoder(texts, input_lengths, text_mask)
-                        asr = (t_en @ s2s_attn_mono)
+                        t_en = torch.nan_to_num(t_en, nan=0.0, posinf=0.0, neginf=0.0)
+                        asr      = (t_en @ s2s_attn)
+                        asr_mono = (t_en @ s2s_attn_mono)
 
                         d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
@@ -706,20 +1111,6 @@ def main(config_path):
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-                    # log_print("Tracing Model Component Shapes:\n", logger)
-                    # log_print("Decoder:", logger)
-                    # trace_shapes(model.decoder)
-                    # log_print("Predictor:", logger)
-                    # trace_shapes(model.predictor)
-                    # log_print("Style Encoder:", logger)
-                    # trace_shapes(model.style_encoder)
-                    # log_print("Text Encoder:", logger)
-                    # trace_shapes(model.text_encoder)
-                    # log_print("Predictor Encoder:", logger)
-                    # trace_shapes(model.predictor_encoder)
-                    # log_print("Diffusion:", logger)
-                    # trace_shapes(model.diffusion)
-
                     d, p = model.predictor(d_en, s, 
                                                         input_lengths, 
                                                         s2s_attn_mono, 
@@ -727,29 +1118,36 @@ def main(config_path):
                     # get clips
                     mel_len = int(mel_input_length.min().item() / 2 - 1)
                     en = []
+                    en_mono_list = []
                     gt = []
                     p_en = []
                     wav = []
+                    wav_cpu = []
 
                     for bib in range(len(mel_input_length)):
                         mel_length = int(mel_input_length[bib].item() / 2)
 
                         random_start = np.random.randint(0, mel_length - mel_len)
+                        
                         en.append(asr[bib, :, random_start:random_start+mel_len])
+                        en_mono_list.append(asr_mono[bib, :, random_start:random_start+mel_len])
+
                         p_en.append(p[bib, :, random_start:random_start+mel_len])
 
                         gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
 
                         y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                        wav.append(torch.from_numpy(y).to(device))
+                        wav_cpu.append(torch.from_numpy(y))
 
-                    wav = torch.stack(wav).float().detach()
+                    wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
 
                     en = torch.stack(en)
+                    en_mono = torch.stack(en_mono_list)
                     p_en = torch.stack(p_en)
                     gt = torch.stack(gt).detach()
 
                     s = model.predictor_encoder(gt.unsqueeze(1))
+                    s = torch.nan_to_num(s, 0.0, 0.0, 0.0)
 
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
 
@@ -767,8 +1165,34 @@ def main(config_path):
                     loss_dur /= texts.size(0)
 
                     s = model.style_encoder(gt.unsqueeze(1))
+                    s = torch.nan_to_num(s, 0.0, 0.0, 0.0)
+
+                    en       = torch.nan_to_num(en,       0.0, 0.0, 0.0)
+                    en_mono  = torch.nan_to_num(en_mono,  0.0, 0.0, 0.0)
+                    F0_fake  = torch.nan_to_num(F0_fake,  0.0, 0.0, 0.0)
+                    N_fake   = torch.nan_to_num(N_fake,   0.0, 0.0, 0.0)
 
                     y_rec = model.decoder(en, F0_fake, N_fake, s)
+                    if not torch.isfinite(y_rec).all():
+                        # one FP32 retry on decoder, then monotonic fallback once
+                        dec_mod = getattr(model["decoder"], "module", model["decoder"])
+                        try:
+                            orig_dtype = next(dec_mod.parameters()).dtype
+                        except StopIteration:
+                            orig_dtype = torch.float32
+                        try:
+                            dec_mod.to(torch.float32)
+                            y_rec = dec_mod(en.float(), F0_fake.float(), N_fake.float(), s.float())
+                        finally:
+                            dec_mod.to(orig_dtype)
+                        if not torch.isfinite(y_rec).all():
+                            # use monotonic attention features once
+                            y_rec = dec_mod(en_mono.float(), F0_fake.float(), N_fake.float(), s.float())
+
+                            if not torch.isfinite(y_rec).all():
+                                # skip batch — don’t poison val average
+                                continue
+
                     loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
 
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 
@@ -803,12 +1227,15 @@ def main(config_path):
                     traceback.print_exc()
                     continue
 
+            # light allocator trim after val
+            _trim_cache("post-val"); gc.collect()
+
         log_print(f"Epochs: {epoch + 1}", logger)
         log_print('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n', logger)
         log_print('\n\n\n', logger)
-        writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/dur_loss', loss_align / iters_test, epoch + 1)
-        writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
+
+        if ema_backups is not None:
+            ema.restore(model, ema_backups)
         
         if epoch < joint_epoch:
             # generating reconstruction examples with GT duration
@@ -826,7 +1253,6 @@ def main(config_path):
 
                     y_rec = model.decoder(en, F0_real, real_norm, s)
 
-                    writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
 
                     s_dur = model.predictor_encoder(gt.unsqueeze(1))
                     p_en = p[bib, :, :mel_length // 2].unsqueeze(0)
@@ -834,11 +1260,6 @@ def main(config_path):
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
 
                     y_pred = model.decoder(en, F0_fake, N_fake, s)
-
-                    writer.add_audio('pred/y' + str(bib), y_pred.cpu().numpy().squeeze(), epoch, sample_rate=sr)
-
-                    if epoch == 0:
-                        writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
 
                     if bib >= 5:
                         break
@@ -890,15 +1311,16 @@ def main(config_path):
                     out = model.decoder((t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)), 
                                             F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
-                    writer.add_audio('pred/y' + str(bib), out.cpu().numpy().squeeze(), epoch, sample_rate=sr)
-
                     if bib >= 5:
                         break
                             
         if epoch % saving_epoch == 0:
-            if (loss_test / iters_test) < best_loss:
-                best_loss = loss_test / iters_test
+            cur = (loss_test / iters_test)
+            if cur < best_loss:
+                best_loss = cur
+                logger.info(f"[ckpt] new best_loss={best_loss:.4f} at epoch {epoch}")
             log_print('Saving..', logger)
+
             state = {
                 'net':  {key: model[key].state_dict() for key in model}, 
                 'optimizer': optimizer.state_dict(),
@@ -908,6 +1330,7 @@ def main(config_path):
             }
             save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
             torch.save(state, save_path)
+            logger.info(f"[ckpt] saved: {save_path}")
             
             # if estimate sigma, save the estimated simga
             if model_params.diffusion.dist.estimate_sigma_data:
@@ -915,6 +1338,11 @@ def main(config_path):
                 
                 with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
                     yaml.dump(config, outfile, default_flow_style=True)
+
+            gc.collect(); 
+            if torch.cuda.is_available(): 
+                torch.cuda.empty_cache()
+            logger.info("[train] COMPLETE")
 
 def trace_shapes(model, logger=None):
     def _hook(mod, inp, out):

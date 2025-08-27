@@ -4,7 +4,7 @@ save_freq: 10
 log_interval: 10
 device: "cuda"
 epochs_1st: 5 # number of epochs for first stage training (pre-training)
-epochs_2nd: 4 # number of epochs for second stage training (joint training)
+epochs_2nd: 5 # number of epochs for second stage training (joint training)
 batch_size: 2
 grad_accum: 1
 ga_max: 4
@@ -15,9 +15,9 @@ ga_free_high_pct: 40.0
 ga_grow_patience: 4
 ga_grow_cooldown: 6
 fm_max_chunks: 64
-max_len: 1000 # maximum number of frames (10 seconds)
-pretrained_model: ""
-second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
+max_len: 400 # maximum number of frames (10 seconds) , For second stage due to lack of memory forced to use 400, want 1000
+pretrained_model: "Models/LJSpeech/first_stage.pth"
+second_stage_load_pretrained: false # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
 decoder_channels_last: true
 
@@ -114,8 +114,8 @@ loss_params:
     lambda_sty: 1. # style reconstruction loss (2nd stage)
     lambda_diff: 1. # score matching loss (2nd stage)
     
-    diff_epoch: 2 # style diffusion starting epoch (2nd stage)
-    joint_epoch: 3 # joint training starting epoch (2nd stage)
+    diff_epoch: 1 # style diffusion starting epoch (2nd stage)
+    joint_epoch: 2 # joint training starting epoch (2nd stage)
 
 optimizer_params:
   lr: 0.0001 # general learning rate
@@ -133,4 +133,11 @@ slmadv_params:
   thresh: 5 # gradient norm above which the gradient is scaled
   scale: 0.01 # gradient scaling factor for predictors from SLM discriminators
   sig: 1.5 # sigma for differentiable duration modeling
-  
+
+ema:
+  enable: true
+  decay: 0.999
+  modules: ["decoder","style_encoder","predictor","predictor_encoder"]
+  start_epoch: 0
+  eval: true
+  update_freq: 1
