@@ -202,6 +202,16 @@ class EMAStore:
                     p.copy_(sd[n])
         logger.info(f"[ema] restored original weights")
 
+def _set_requires_grad(mod, flag: bool):
+    """Toggle requires_grad on a (possibly DP-wrapped) module."""
+    if mod is None:
+        return
+    try:
+        for p in _unwrap(mod).parameters():
+            p.requires_grad = flag
+    except Exception:
+        pass
+
 
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config.yml', type=str)
@@ -225,8 +235,6 @@ def main(config_path):
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
 
-    
-    # log_print(f"Config: {config}", logger)
 
     batch_size = config.get('batch_size', 10)
     grad_accum = int(config.get('grad_accum', 4))    
@@ -419,7 +427,7 @@ def main(config_path):
     wl = MyDataParallel(wl)
         
     _diff_core = _get_diffusion_core(model)
-    sampler = DiffusionSampler(
+    train_sampler = DiffusionSampler(
         _diff_core,
         sampler=ADPM2Sampler(),
         sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0),
@@ -501,7 +509,7 @@ def main(config_path):
     running_std = []
     
     slmadv_params = Munch(config['slmadv_params'])
-    slmadv = SLMAdversarialLoss(model, wl, sampler, 
+    slmadv = SLMAdversarialLoss(model, wl, train_sampler, 
                                 slmadv_params.min_len, 
                                 slmadv_params.max_len,
                                 batch_percentage=slmadv_params.batch_percentage,
@@ -509,11 +517,40 @@ def main(config_path):
                                 sig=slmadv_params.sig
                                )
 
+    logger.info(f"[cfg] SLM-ADV: iter={slmadv_params.iter} "
+                f"thresh={slmadv_params.thresh} scale={slmadv_params.scale}")
+
 
     # ---- EMA store (after all modules exist) ----
     ema = None
     if ema_cfg.enable:
         ema = EMAStore(model, ema_cfg.modules, decay=ema_cfg.decay, device=device)
+    
+    # ---- Adversarial window cap (bounds MSD/MPD memory) ----
+    ADV_MAX_SAMPLES = int(config.get("adv_max_samples", os.getenv("ADV_MAX_SAMPLES", "24000")))  # ~1s @ 24kHz
+    logger.info(f"[cfg] adv_max_samples={ADV_MAX_SAMPLES}")
+
+    def _prep_adv_pair(y_real, y_fake, max_samples: int):
+        """
+        Returns (real, fake) cropped & sanitised for MSD/MPD.
+        Input may be [B, T] or [B,1,T]. Output is [B,1,T_crop].
+        """
+        # to [B, T]
+        if y_real.dim() == 3 and y_real.size(1) == 1: y_real = y_real[:, 0, :]
+        if y_fake.dim() == 3 and y_fake.size(1) == 1: y_fake = y_fake[:, 0, :]
+        if y_real.dim() != 2 or y_fake.dim() != 2:
+            raise RuntimeError(f"adv pair expects [B,T] or [B,1,T]; got real={tuple(y_real.shape)} fake={tuple(y_fake.shape)}")
+        T = min(y_real.size(-1), y_fake.size(-1))
+        if T > max_samples:
+            import numpy as _np
+            s0 = int(_np.random.randint(0, T - max_samples + 1))
+            s1 = s0 + max_samples
+            y_real = y_real[:, s0:s1]
+            y_fake = y_fake[:, s0:s1]
+        # sanitise waveforms to avoid cascading NaNs/Inf
+        y_real = torch.nan_to_num(y_real, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        y_fake = torch.nan_to_num(y_fake, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        return y_real.unsqueeze(1), y_fake.unsqueeze(1)
 
     # GA state
     acc_steps = start_ga
@@ -536,6 +573,8 @@ def main(config_path):
         last_d_marker = "D-"
         slm_skips = 0      # true skips after gate opens (e.g., cadence, None from slmadv)
         slm_gated = 0      # gated steps before epoch >= diff_epoch
+        slm_cadence_skips = 0
+        slm_fail_skips = 0
 
         _trim_cache("epoch-start"); 
         gc.collect()
@@ -658,21 +697,22 @@ def main(config_path):
                     
                     if model_params.diffusion.dist.estimate_sigma_data:
                         _edm = _get_diffusion_core(model)
-                        sigma_val = s_trg.std(axis=-1).mean().item()
+                        sigma_val = s_trg.detach().to('cpu', copy=True).std(dim=-1).mean().item()
                         _edm.sigma_data = sigma_val
                         running_std.append(sigma_val)
                         
                     if multispeaker:
-                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                        s_preds = train_sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
                             embedding=bert_dur,
                             embedding_scale=1,
                                     features=ref, # reference from the same speaker as the embedding
                                 embedding_mask_proba=0.1,
                                 num_steps=num_steps).squeeze(1)
-                        loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
+                        _edm = _get_diffusion_core(model)
+                        loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
                         loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
                     else:
-                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                        s_preds = train_sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
                             embedding=bert_dur,
                             embedding_scale=1,
                                 embedding_mask_proba=0.1,
@@ -768,9 +808,28 @@ def main(config_path):
                 # -------- Discriminator path (accumulate; step at boundary) --------
                 d_loss = 0.0
                 if start_ds:
-                    d_loss = dl(wav.detach(), y_rec.detach()).mean()
-                    (d_loss / max(1, acc_steps)).backward()
+                    # Enable D grads, disable G grads to avoid retaining G activations during D backward
+                    for k in ("mpd", "msd"):
+                        if k in model: _set_requires_grad(model[k], True)
+                    for k in ("decoder","style_encoder","predictor","predictor_encoder","diffusion","bert","bert_encoder"):
+                        if k in model: _set_requires_grad(model[k], False)
+
+                    # Use fully detached, cropped, sanitised reals/fakes for D
+                    _y_real_adv, _y_fake_adv = _prep_adv_pair(wav.detach(), y_rec.detach(), ADV_MAX_SAMPLES)
+                    d_loss = dl(_y_real_adv, _y_fake_adv).mean().float()
+                    if not torch.isfinite(d_loss):
+                        logger.info("[skip] non-finite d_loss; skipping D backward for this batch")
+                    else:
+                        (d_loss / max(1, acc_steps)).backward()
                     dt_disc = _t.perf_counter() - _t6; _t7 = _t.perf_counter()
+
+                    # Restore: disable D grads, enable G grads
+                    for k in ("mpd", "msd"):
+                        if k in model: _set_requires_grad(model[k], False)
+                    for k in ("decoder","style_encoder","predictor","predictor_encoder","diffusion","bert","bert_encoder"):
+                        if k in model: _set_requires_grad(model[k], True)
+
+
                 else:
                     d_loss = 0.0
 
@@ -780,7 +839,9 @@ def main(config_path):
                 dt_stft = _t.perf_counter() - _t7 if start_ds else _t.perf_counter() - _t6
 
                 if start_ds:
-                    loss_gen_all = gl(wav, y_rec).mean()
+                    # Cropped/sanitised window for G's adv/FM too (bounds MSD/MPD memory)
+                    _y_real_adv_g, _y_fake_adv_g = _prep_adv_pair(wav, y_rec, ADV_MAX_SAMPLES)
+                    loss_gen_all = gl(_y_real_adv_g, _y_fake_adv_g).mean()
                 else:
                     loss_gen_all = 0
                 loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
@@ -825,8 +886,36 @@ def main(config_path):
                     # D cadence (optional reduction)
                     do_d_update = ((i // max(1, acc_steps)) % max(1, D_UPDATE_EVERY) == 0)
                     if start_ds and do_d_update:
-                        optimizer.step('msd'); 
-                        optimizer.step('mpd')
+                        # Clip grads & zero any non-finite grads before D step; then safe-step each D
+                        def _clip_and_clean(name, max_norm=1.0):
+                            try:
+                                torch.nn.utils.clip_grad_norm_(model[name].parameters(), max_norm,
+                                                               error_if_nonfinite=False, foreach=False)
+                            except Exception as _e:
+                                logger.info(f"[clip] {name} ignored ({_e})")
+                            bad = False
+                            for p in model[name].parameters():
+                                g = getattr(p, "grad", None)
+                                if g is not None and not torch.isfinite(g).all():
+                                    p.grad = None
+                                    bad = True
+                            return not bad
+                        def _safe_step(name):
+                            try:
+                                optimizer.step(name)
+                                return True
+                            except Exception as e:
+                                logger.info(f"[step-skip] {name}: {type(e).__name__}: {e}")
+                                for p in model[name].parameters():
+                                    if getattr(p, "grad", None) is not None:
+                                        p.grad = None
+                                try: torch.cuda.empty_cache()
+                                except Exception: pass
+                                return False
+                        ok_msd = _clip_and_clean('msd')
+                        ok_mpd = _clip_and_clean('mpd')
+                        if ok_msd: _safe_step('msd')
+                        if ok_mpd: _safe_step('mpd')
                         last_d_marker = "D+"
                     else:
                         last_d_marker = "D-"
@@ -839,9 +928,18 @@ def main(config_path):
                         optimizer.step('style_encoder'); optimizer.step('decoder')
                         # mark D and print a compact step map
                         last_d_marker = "D+" if (start_ds and do_d_update) else "D-"
+
+                        wd_step = (start_ds and do_d_update)
+                        cad = getattr(slmadv, "skip_update", 1)
+                        try:
+                            wd_step = wd_step and (((i // max(1, acc_steps)) % max(1, cad)) == 0)
+                        except Exception:
+                            pass
+
                         _stepped = {
                             "msd": (start_ds and do_d_update),
                             "mpd": (start_ds and do_d_update),
+                            "wd":  wd_step,
                             "bert": True, "bert_enc": True,
                             "pred": True, "pred_enc": True,
                             "diff": (epoch >= diff_epoch and 'diffusion' in optimizer.optimizers),
@@ -892,6 +990,10 @@ def main(config_path):
                     if use_ind:
                         ref_lengths = input_lengths
                         ref_texts = texts
+
+                    # Lightweight scalars for logging; lets us free tensors early
+                    log_discLM = 0.0
+                    log_genLM  = 0.0
                         
                     slm_out = slmadv(i, 
                                     y_rec_gt, 
@@ -907,11 +1009,25 @@ def main(config_path):
                             slm_gated += 1
                         else:
                             slm_skips += 1
+                            cadence = getattr(slmadv, "skip_update", None)
+                            if cadence and ((i // max(1, acc_steps)) % max(1, cadence)) != 0:
+                                slm_cadence_skips += 1
+                            else:
+                                slm_fail_skips += 1
+
                         d_loss_slm, loss_gen_lm, y_pred = 0, 0, None
+                        log_discLM, log_genLM = 0.0, 0.0
                     else:
                         d_loss_slm, loss_gen_lm, y_pred = slm_out
                         # SLM generator loss (accumulate; step already handled at boundary)
                         (loss_gen_lm / max(1, acc_steps)).backward()
+                        # Keep scalar copies for logs; free big tensors
+                        try:
+                            log_discLM = float(_scalar(d_loss_slm))
+                            log_genLM  = float(_scalar(loss_gen_lm))
+                        except Exception:
+                            pass
+                        y_pred = None  # drop heavy tensor reference
 
                     # compute the gradient norm
                     total_norm = {}
@@ -950,6 +1066,13 @@ def main(config_path):
                         d_loss_slm.backward(retain_graph=True)
                         optimizer.step('wd')
 
+                        # free SLM tensors now that grads are consumed
+                        try:
+                            del d_loss_slm
+                            del loss_gen_lm
+                        except Exception:
+                            pass
+
                 else:
                     d_loss_slm, loss_gen_lm = 0, 0
                     
@@ -967,7 +1090,9 @@ def main(config_path):
                     if not start_ds:
                         logger.info(f"[slm-adv] gated: {slm_gated}/{total} steps so far (diff_epoch={diff_epoch}, current={epoch})")
                     else:
-                        logger.info(f"[slm-adv] skipped {slm_skips}/{total} steps ({100.0*slm_skips/total:.1f}%) this epoch")
+                        logger.info(f"[slm-adv] skipped {slm_skips}/{total} "
+                                    f"(cadence={slm_cadence_skips}, fail={slm_fail_skips}) this epoch")
+
                     batch_time = time.time() - start_time
                     lr_now = optimizer.optimizers['decoder'].param_groups[0]['lr']
                     _log_free("train-boundary")
@@ -1006,8 +1131,8 @@ def main(config_path):
                             'gen':   _scalar(loss_gen_all),
                             'sty':   _scalar(loss_sty),
                             'diff':  _scalar(loss_diff),
-                            'discLM': _scalar(d_loss_slm),
-                            'genLM':  _scalar(loss_gen_lm)
+                            'discLM': float(log_discLM),
+                            'genLM':  float(log_genLM)
                         },
                         logger=logger,
                         global_step=iters,
@@ -1054,7 +1179,7 @@ def main(config_path):
         if ema and ema_cfg.eval:
             ema_backups = ema.swap_in(model)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             iters_test = 0
             val_start = time.time()
             for batch_idx, batch in enumerate(val_dataloader):
@@ -1261,11 +1386,26 @@ def main(config_path):
 
                     y_pred = model.decoder(en, F0_fake, N_fake, s)
 
+                    # free big temps for previews
+                    try:
+                        del y_rec
+                        del y_pred
+                    except Exception:
+                        pass
+
                     if bib >= 5:
                         break
         else:
             # generating sampled speech from text directly
             with torch.no_grad():
+                # Build a lightweight, local sampler for previews; free after use
+                val_sampler = DiffusionSampler(
+                    _get_diffusion_core(model),
+                    sampler=ADPM2Sampler(),
+                    sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0),
+                    clamp=False
+                )
+
                 # compute reference styles
                 if multispeaker and epoch >= diff_epoch:
                     ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
@@ -1274,13 +1414,13 @@ def main(config_path):
                     
                 for bib in range(len(d_en)):
                     if multispeaker:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
+                        s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
                               embedding=bert_dur[bib].unsqueeze(0),
                               embedding_scale=1,
                                 features=ref_s[bib].unsqueeze(0), # reference from the same speaker as the embedding
                                  num_steps=5).squeeze(1)
                     else:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
+                        s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
                               embedding=bert_dur[bib].unsqueeze(0),
                               embedding_scale=1,
                                  num_steps=5).squeeze(1)
@@ -1311,10 +1451,24 @@ def main(config_path):
                     out = model.decoder((t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)), 
                                             F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
+                    # free per-preview temps
+                    try:
+                        del s_pred, s, ref, d, x, duration, pred_dur, pred_aln_trg, en, F0_pred, N_pred, out
+                    except Exception:
+                        pass
+
                     if bib >= 5:
                         break
-                            
-        if epoch % saving_epoch == 0:
+
+                # free the local sampler & trim allocator
+                try:
+                    del val_sampler
+                    gc.collect()
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        if epoch % saving_epoch == 0 or epoch == epochs:
             cur = (loss_test / iters_test)
             if cur < best_loss:
                 best_loss = cur
@@ -1375,7 +1529,7 @@ def trace_shapes(model, logger=None):
 def _redirect_io(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'train_stdout.log')
-    log_file = open(log_path, 'a', buffering=1)  # line-buffered
+    log_file = open(log_path, 'a', buffering=262144)  # ~256 KiB buffered
     sys.stdout = log_file
     sys.stderr = log_file
     faulthandler.enable(file=log_file)           # C-level faults

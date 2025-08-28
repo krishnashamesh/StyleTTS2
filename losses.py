@@ -5,6 +5,7 @@ import torchaudio
 from transformers import AutoModel
 from typing import Optional, List
 from contextlib import nullcontext
+from torch.utils.checkpoint import checkpoint
 
 class SpectralConvergengeLoss(torch.nn.Module):
     """Spectral convergence loss module."""
@@ -293,8 +294,12 @@ class WavLMLoss(torch.nn.Module):
         super(WavLMLoss, self).__init__()
         self.wavlm = AutoModel.from_pretrained(model)
         # Freeze weights (we don't train WavLM), but KEEP grad flow to inputs
-        for p in self.wavlm.parameters(): p.requires_grad_(False)
-        # Enable model's internal checkpointing to reduce VRAM while preserving FP32 grads
+        for p in self.wavlm.parameters():
+            p.requires_grad_(False)
+        # Turn off dropout for stable targets/features
+        self.wavlm.eval()
+        # Enable HF’s internal gradient checkpointing (active only if .training = True).
+        # We keep it enabled as a harmless fallback, but rely on manual checkpointing below.
         try:
             if hasattr(self.wavlm, "gradient_checkpointing_enable"):
                 # Most HF models require use_cache=False for checkpointing
@@ -307,6 +312,20 @@ class WavLMLoss(torch.nn.Module):
         self.wd = wd
         self.resample = torchaudio.transforms.Resample(model_sr, slm_sr)
         self.slm_max_seconds = slm_max_seconds
+
+    # --- helpers ---------------------------------------------------------
+    def _as_wavlm_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure shape [B, L] float32 for HF WavLM.
+        If input is [B, 1, L], drop the channel dim. If [L], add batch dim.
+        """
+        if x.ndim == 3 and x.size(1) == 1:   # [B,1,L] -> [B,L]
+            x = x[:, 0, :]
+        elif x.ndim == 1:                     # [L] -> [1,L]
+            x = x.unsqueeze(0)
+        elif x.ndim != 2:
+            raise RuntimeError(f"WavLM expects [B, L], got {tuple(x.shape)}")
+        return x.contiguous().to(dtype=torch.float32)
      
     def forward(self, wav, y_rec):
 
@@ -318,16 +337,23 @@ class WavLMLoss(torch.nn.Module):
                 if wav_16.shape[-1] > max_samp:
                     st = (wav_16.shape[-1] - max_samp) // 2
                     wav_16 = wav_16[..., st:st+max_samp]
+
+            wav_16 = self._as_wavlm_input(wav_16)  # ensure [B, L]
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-        # Fake branch: needs gradient to flow to y_rec → no no_grad here
+
+        # Fake branch: needs gradient to flow to y_rec → apply manual checkpointing
         y_rec_16 = self.resample(y_rec)
         if self.slm_max_seconds:
             max_samp = int(self.slm_max_seconds * self.resample.new_freq)
             if y_rec_16.shape[-1] > max_samp:
                 st = (y_rec_16.shape[-1] - max_samp) // 2
                 y_rec_16 = y_rec_16[..., st:st+max_samp]
-        y_rec_embeddings = self.wavlm(input_values=y_rec_16.squeeze(),
-                                      output_hidden_states=True).hidden_states
+        # make sure input is [B, L] before calling HF WavLM
+        y_rec_16 = self._as_wavlm_input(y_rec_16)
+        # manual checkpoint keeps memory tame even with eval() WavLM
+        def _wavlm_hidden(inp):
+            return self.wavlm(input_values=inp, output_hidden_states=True).hidden_states
+        y_rec_embeddings = checkpoint(_wavlm_hidden, y_rec_16, use_reentrant=False)
 
         floss = 0
         for er, eg in zip(wav_embeddings, y_rec_embeddings):
@@ -343,6 +369,8 @@ class WavLMLoss(torch.nn.Module):
             if y_rec_16.shape[-1] > max_samp:
                 st = (y_rec_16.shape[-1] - max_samp) // 2
                 y_rec_16 = y_rec_16[..., st:st+max_samp]
+
+        y_rec_16 = self._as_wavlm_input(y_rec_16)
         y_rec_embeddings = self.wavlm(input_values=y_rec_16,
                                       output_hidden_states=True).hidden_states
 
@@ -354,9 +382,10 @@ class WavLMLoss(torch.nn.Module):
     
     def discriminator(self, wav, y_rec):
         with torch.no_grad():
-            wav_16 = self.resample(wav)
+
+            wav_16 = self._as_wavlm_input(self.resample(wav))
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-            y_rec_16 = self.resample(y_rec)
+            y_rec_16 = self._as_wavlm_input(self.resample(y_rec))
             y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
 
             y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
@@ -376,7 +405,7 @@ class WavLMLoss(torch.nn.Module):
 
     def discriminator_forward(self, wav):
         with torch.no_grad():
-            wav_16 = self.resample(wav)
+            wav_16 = self._as_wavlm_input(self.resample(wav))
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
             y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
 

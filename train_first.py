@@ -93,6 +93,7 @@ def main(config_path):
 
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
 
     batch_size = config.get('batch_size', 10)
@@ -118,7 +119,7 @@ def main(config_path):
     # TF32 only meaningful when running FP32 paths
     torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
     torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("highest")
 
     # --- Startup banner: print precision + env at the very beginning ---
@@ -361,7 +362,7 @@ def main(config_path):
     
     # losses: pass UNWRAPPED D modules to avoid Accelerate's fp32 output conversion (6b)
     stft_loss = MultiResolutionSTFTLoss().to(device)
-    fm_chunks = int(config.get("fm_max_chunks", 8))
+    fm_chunks = int(config.get("fm_max_chunks", 64))
 
     gl = GeneratorLoss(
             accelerator.unwrap_model(model.mpd),
@@ -580,8 +581,34 @@ def main(config_path):
                     loss_s2s /= texts.size(0)
 
                     loss_mono    = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
-                    # keep bf16 through the D path (avoid inflating activations at the worst time)
-                    loss_gen_all = gl(wav.detach().unsqueeze(1), y_rec).mean()
+
+                    # --- Bound adversarial/FM window to cap discriminator memory ---
+                    ADV_MAX_SAMPLES = int(config.get("adv_max_samples",
+                                                     os.getenv("ADV_MAX_SAMPLES", "24000")))  # ~1s at 24k
+                    y_real_full = wav.detach()  # [B, T]
+                    y_fake_full = y_rec         # [B,1,T] or [B,T]
+                    # Ensure [B, T] for fake
+                    if y_fake_full.dim() == 3 and y_fake_full.size(1) == 1:
+                        y_fake_1d = y_fake_full[:, 0, :]
+                    elif y_fake_full.dim() == 2:
+                        y_fake_1d = y_fake_full
+                    else:
+                        raise RuntimeError(f"unexpected y_rec shape for adv: {tuple(y_fake_full.shape)}")
+                    T = min(y_real_full.size(-1), y_fake_1d.size(-1))
+                    if T > ADV_MAX_SAMPLES:
+                        s0 = int(np.random.randint(0, T - ADV_MAX_SAMPLES + 1))
+                        s1 = s0 + ADV_MAX_SAMPLES
+                        y_real_adv = y_real_full[:, s0:s1]
+                        y_fake_adv = y_fake_1d[:, s0:s1]
+                    else:
+                        y_real_adv = y_real_full
+                        y_fake_adv = y_fake_1d
+                    # sanitize inputs to D to avoid cascading NaNs
+                    y_real_adv = torch.nan_to_num(y_real_adv, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+                    y_fake_adv = torch.nan_to_num(y_fake_adv, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+                    # back to [B,1,T] for discriminators
+                    loss_gen_all = gl(y_real_adv.unsqueeze(1), y_fake_adv.unsqueeze(1)).mean()
+
                     # Intermittent WavLM feature loss to save compute
                     if SLM_UPDATE_EVERY <= 1:
                         loss_slm = wl(wav.detach(), y_rec).mean()
@@ -678,18 +705,47 @@ def main(config_path):
                     # Only update D every Nth accumulation boundary
                     do_d_update = ((iters // acc_steps) % D_UPDATE_EVERY) == 0
                     log_print(f"[cadence] gstep={(iters // acc_steps)} do_d_update={do_d_update}", logger)
+
+
                     if do_d_update:
-                        # D forward in selected AMP context (or fp32)
-                        with amp_context(prec.mode, prec.use_autocast):
-                            d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean()
-                        d_loss_fp32 = d_loss.float()
-                        accelerator.backward(d_loss_fp32 / acc_steps)
-                        # step both discriminators
-                        optimizer.step('msd')
-                        optimizer.step('mpd')
-                        _log_free('post_dstep', iters)
-                        d_loss_val = float(d_loss.detach().item())
-                        did_d_update = True
+                        # Strict FP32 D forward/backward with guards
+                        d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean().float()
+                        if not torch.isfinite(d_loss):
+                            if accelerator.is_main_process:
+                                log_print("[skip] non-finite d_loss; zeroing and skipping D step", logger)
+                            optimizer.zero_grad(set_to_none=True)
+                        else:
+                            accelerator.backward(d_loss / acc_steps)
+                            # Clip/check grads per D, then safe-step
+                            def _clip_and_check_d(name, max_norm=1.0):
+                                torch.nn.utils.clip_grad_norm_(model[name].parameters(), max_norm,
+                                                               error_if_nonfinite=False, foreach=False)
+                                for p in model[name].parameters():
+                                    g = getattr(p, "grad", None)
+                                    if g is not None and not torch.isfinite(g).all():
+                                        p.grad = None
+                                        return False
+                                return True
+                            def _safe_step_d(name):
+                                try:
+                                    optimizer.step(name)
+                                    return True
+                                except Exception as e:
+                                    if accelerator.is_main_process:
+                                        log_print(f"[step-skip] {name}: {type(e).__name__}: {e}", logger)
+                                    for p in model[name].parameters():
+                                        if getattr(p, "grad", None) is not None:
+                                            p.grad = None
+                                    try:
+                                        torch.cuda.empty_cache()
+                                    except Exception:
+                                        pass
+                                    return False
+                            if _clip_and_check_d('msd'): _safe_step_d('msd')
+                            if _clip_and_check_d('mpd'): _safe_step_d('mpd')
+                            _log_free('post_dstep', iters)
+                            d_loss_val = float(d_loss.detach().item())
+                            did_d_update = True
                     # Note: grads are cleared globally below with optimizer.zero_grad(...)
                 # else: skip D forward/back entirely for real compute savings
 
@@ -1018,7 +1074,7 @@ def main(config_path):
 def _redirect_io(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'train_stdout.log')
-    log_file = open(log_path, 'a', buffering=1)  # line-buffered
+    log_file = open(log_path, 'a', buffering=262144)  # line-buffered
     sys.stdout = log_file
     sys.stderr = log_file
     faulthandler.enable(file=log_file)           # C-level faults
