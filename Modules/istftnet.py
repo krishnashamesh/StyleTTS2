@@ -109,6 +109,9 @@ class TorchSTFT(torch.nn.Module):
         return torch.abs(forward_transform), torch.angle(forward_transform)
 
     def inverse(self, magnitude, phase):
+        # Guards: keep magnitude non-negative & finite; phase finite
+        magnitude = torch.nan_to_num(magnitude, 0.0, 0.0, 0.0).clamp_min_(0)
+        phase = torch.nan_to_num(phase, 0.0, 0.0, 0.0)
         inverse_transform = torch.istft(
             magnitude * torch.exp(phase * 1j),
             self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
@@ -387,8 +390,14 @@ class Generator(torch.nn.Module):
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+
+        x_spec_logits = x[:, :self.post_n_fft // 2 + 1, :]
+        x_spec_logits = x_spec_logits.clamp_max(20.0)  # avoids exp overflow
+        spec = torch.exp(x_spec_logits)
+        spec = torch.nan_to_num(spec, 0.0, 0.0, 0.0)
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        phase = torch.nan_to_num(phase, 0.0, 0.0, 0.0)
+
         return self.stft.inverse(spec, phase)
     
     def fw_phase(self, x, s):
@@ -404,9 +413,15 @@ class Generator(torch.nn.Module):
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.reflection_pad(x)
+
         x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        x_spec_logits = x[:, :self.post_n_fft // 2 + 1, :]
+        x_spec_logits = x_spec_logits.clamp_max(20.0)              # avoid exp overflow
+        spec  = torch.exp(x_spec_logits)
+        spec  = torch.nan_to_num(spec,  0.0, 0.0, 0.0)
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        phase = torch.nan_to_num(phase, 0.0, 0.0, 0.0)
+
         return spec, phase
 
     def remove_weight_norm(self):

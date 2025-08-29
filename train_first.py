@@ -2,6 +2,11 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
 
+from torch.utils.checkpoint import checkpoint
+
+import torch.utils.checkpoint as tcp
+tcp.set_checkpoint_debug_enabled(True)
+
 import os.path as osp
 import re
 import sys
@@ -39,7 +44,7 @@ from accelerate import DistributedDataParallelKwargs
 
 try:
     from torch.backends.cuda import sdp_kernel
-    sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
+    sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True)
 except Exception:
     pass
 
@@ -117,8 +122,8 @@ def main(config_path):
     )
 
     # TF32 only meaningful when running FP32 paths
-    torch.backends.cuda.matmul.allow_tf32 = bool(prec.tf32)
-    torch.backends.cudnn.allow_tf32 = bool(prec.tf32)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("highest")
 
@@ -433,25 +438,40 @@ def main(config_path):
                 with torch.no_grad():
                     ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
             else:
-                ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                # Save ~25–35% VRAM here on long sequences (≈8–15% time overhead)
+                ppgs, s2s_pred, s2s_attn = checkpoint(
+                    lambda A, B, C: model.text_aligner(A, B, C),
+                    mels, mask, texts
+                )
 
             s2s_attn = s2s_attn.transpose(-1, -2)
             s2s_attn = s2s_attn[..., 1:]
             s2s_attn = s2s_attn.transpose(-1, -2)
+
+            # free PPGs early (not used in losses)
+            del ppgs
 
             with torch.no_grad():
                 attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
                 attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                 attn_mask = (attn_mask < 1)
 
-            s2s_attn.masked_fill_(attn_mask, 0.0)
+            # NEW: mask, sanitize, and row-renormalize attention (prevents NaNs from diff path)
+            # avoid in-place edits on checkpointed output
+            s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
+            s2s_attn = torch.nan_to_num(s2s_attn, nan=0.0, posinf=0.0, neginf=0.0)
+            row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            s2s_attn = s2s_attn / row_sum
                         
             with torch.no_grad():
                 mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
                 s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
-            # encode
-            t_en = model.text_encoder(texts, input_lengths, text_mask)
+            # encode (CKPT) — trims ~20–30% VRAM here (≈6–12% time)
+            t_en = checkpoint(
+                lambda T, L, M: model.text_encoder(T, L, M),
+                texts, input_lengths, text_mask
+            )
 
             # 50% of chance of using monotonic version
             if bool(random.getrandbits(1)):
@@ -535,7 +555,9 @@ def main(config_path):
             gt = torch.stack(gt).detach()
             st = torch.stack(st).detach()
 
-            wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+            # Keep on CPU (pinned); move only cropped slices later
+            wav = torch.stack(wav_cpu).float().pin_memory()
+
             _log_free('post_h2d', iters)
 
             # clip too short to be used by the style encoder
@@ -551,12 +573,29 @@ def main(config_path):
             else:
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
             
-            s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+            s_inp = st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+            # Save ~10–20% VRAM in this block (≈3–8% time overhead)
+            s = checkpoint(lambda X: model.style_encoder(X), s_inp, use_reentrant=False)
+
             # strong numeric guard: keep validation/train stable if upstream produced bad values
             s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+            del gt, st
 
-            # First try with whatever the model dtype currently is (bf16 under Accelerate)
-            y_rec = model.decoder(en, F0_real, real_norm, s)
+            # Harden decoder checkpoint: clone ALL inputs to sever any storage/view aliasing
+            en_c  = en.contiguous().clone()
+            f0_c  = F0_real.contiguous().clone()
+            rn_c  = real_norm.contiguous().clone()
+            s_c   = s.contiguous().clone()
+            # Save ~30–45% VRAM on G-steps (≈10–20% time overhead)
+            y_rec = checkpoint(
+                lambda A, B, C, D: model.decoder(A, B, C, D),
+                en_c, f0_c, rn_c, s_c
+            )
+            # IMPORTANT: sever any alias to checkpointed storage (output)
+            y_rec = y_rec.clone().contiguous()
+            # Free clones promptly
+            del en_c, f0_c, rn_c, s_c
+
             # If something explodes numerically, skip this batch (do NOT FP32-retry in TRAIN)
             if not torch.isfinite(y_rec).all():
                 if accelerator.is_main_process:
@@ -566,7 +605,10 @@ def main(config_path):
 
             with accelerator.accumulate(model["decoder"]):
                 # no zero_grad here; we’re accumulating
-                loss_mel = stft_loss(y_rec.squeeze().float(), wav.detach())
+
+                wav_dev = wav.to(device, non_blocking=True)
+                loss_mel = stft_loss(y_rec.contiguous().squeeze(1).float(), wav_dev.detach())
+                del wav_dev
 
                 # strong numeric guard — skip batch if non-finite
                 if not torch.isfinite(loss_mel):
@@ -581,41 +623,50 @@ def main(config_path):
                     loss_s2s /= texts.size(0)
 
                     loss_mono    = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
+                    del s2s_attn, s2s_attn_mono, attn_mask
 
                     # --- Bound adversarial/FM window to cap discriminator memory ---
-                    ADV_MAX_SAMPLES = int(config.get("adv_max_samples",
-                                                     os.getenv("ADV_MAX_SAMPLES", "24000")))  # ~1s at 24k
-                    y_real_full = wav.detach()  # [B, T]
-                    y_fake_full = y_rec         # [B,1,T] or [B,T]
-                    # Ensure [B, T] for fake
-                    if y_fake_full.dim() == 3 and y_fake_full.size(1) == 1:
-                        y_fake_1d = y_fake_full[:, 0, :]
-                    elif y_fake_full.dim() == 2:
-                        y_fake_1d = y_fake_full
-                    else:
-                        raise RuntimeError(f"unexpected y_rec shape for adv: {tuple(y_fake_full.shape)}")
-                    T = min(y_real_full.size(-1), y_fake_1d.size(-1))
-                    if T > ADV_MAX_SAMPLES:
-                        s0 = int(np.random.randint(0, T - ADV_MAX_SAMPLES + 1))
-                        s1 = s0 + ADV_MAX_SAMPLES
-                        y_real_adv = y_real_full[:, s0:s1]
-                        y_fake_adv = y_fake_1d[:, s0:s1]
-                    else:
-                        y_real_adv = y_real_full
-                        y_fake_adv = y_fake_1d
-                    # sanitize inputs to D to avoid cascading NaNs
-                    y_real_adv = torch.nan_to_num(y_real_adv, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
-                    y_fake_adv = torch.nan_to_num(y_fake_adv, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
-                    # back to [B,1,T] for discriminators
-                    loss_gen_all = gl(y_real_adv.unsqueeze(1), y_fake_adv.unsqueeze(1)).mean()
+                    ADV_MAX_SAMPLES = int(config.get("adv_max_samples", os.getenv("ADV_MAX_SAMPLES", "24000")))
+                    # Helper: crop+sanitize to [B,1,T_crop] for both real/fake; report chosen crop
+                    def _prep_adv_pair(y_real, y_fake, cap):
+                        if y_real.dim() == 3 and y_real.size(1) == 1: y_real = y_real[:, 0, :]
+                        if y_fake.dim() == 3 and y_fake.size(1) == 1: y_fake = y_fake[:, 0, :]
+                        Ttot = min(y_real.size(-1), y_fake.size(-1))
+                        if Ttot > cap:
+                            s0 = int(np.random.randint(0, Ttot - cap + 1)); s1 = s0 + cap
+
+                            # clone slices so they don't share storage with y_rec
+                            y_real = y_real[:, s0:s1].clone()
+                            y_fake = y_fake[:, s0:s1].clone()
+                        else:
+                            # even without cropping, break any alias to the checkpointed y_rec
+                            y_real = y_real.clone()
+                            y_fake = y_fake.clone()
+
+                        # out-of-place sanitize (no trailing underscore)
+                        y_real = torch.nan_to_num(y_real, 0.0, 1.0, -1.0).clamp(-1, 1)
+                        y_fake = torch.nan_to_num(y_fake, 0.0, 1.0, -1.0).clamp(-1, 1)
+                        # keep grads intact but ensure distinct storage/views
+                        return y_real.unsqueeze(1).contiguous(), y_fake.unsqueeze(1).contiguous(), Ttot, y_real.size(-1)
+
+                    y_real_adv, y_fake_adv, Ttot, Tc = _prep_adv_pair(wav, y_rec, ADV_MAX_SAMPLES)
+                    y_real_adv = y_real_adv.to(device, non_blocking=True)
+                    # one-liner: chosen crop for G path
+                    if (i + 1) % max(1, log_interval) == 0:
+                        log_print(f"[adv] G: crop={int(Tc)}/{int(Ttot)} samples (cap={ADV_MAX_SAMPLES})", logger)
+                    loss_gen_all = gl(y_real_adv, y_fake_adv).mean()
 
                     # Intermittent WavLM feature loss to save compute
                     if SLM_UPDATE_EVERY <= 1:
-                        loss_slm = wl(wav.detach(), y_rec).mean()
+                        wav_slm = wav.to(device, non_blocking=True)
+                        loss_slm = wl(wav_slm.detach(), y_rec).mean()
+                        del wav_slm
                     else:
                         use_slm = ((iters // acc_steps) % SLM_UPDATE_EVERY) == 0
                         if use_slm:
-                            loss_slm = wl(wav.detach(), y_rec).mean()
+                            wav_slm = wav.to(device, non_blocking=True)
+                            loss_slm = wl(wav_slm.detach(), y_rec).mean()
+                            del wav_slm
                         else:
                             loss_slm = torch.as_tensor(0.0, device=device)
 
@@ -708,8 +759,15 @@ def main(config_path):
 
 
                     if do_d_update:
+                        # Prepare real/fake for D: crop, sanitise, move real to GPU (reuse helper)
+                        ADV_MAX_SAMPLES = int(config.get("adv_max_samples", os.getenv("ADV_MAX_SAMPLES", "24000")))
+                        y_real_d, y_fake_d, Ttot, Tc = _prep_adv_pair(wav, y_rec.detach(), ADV_MAX_SAMPLES)
+                        y_real_d = y_real_d.to(device, non_blocking=True)
+                        if (i + 1) % max(1, log_interval) == 0:
+                            log_print(f"[adv] D: crop={int(Tc)}/{int(Ttot)} samples (cap={ADV_MAX_SAMPLES})", logger)
+                        
                         # Strict FP32 D forward/backward with guards
-                        d_loss = dl(wav.detach().unsqueeze(1), y_rec.detach()).mean().float()
+                        d_loss = dl(y_real_d, y_fake_d).mean().float()
                         if not torch.isfinite(d_loss):
                             if accelerator.is_main_process:
                                 log_print("[skip] non-finite d_loss; zeroing and skipping D step", logger)
@@ -856,6 +914,9 @@ def main(config_path):
                 with torch.no_grad():
                     mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                     ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                    
+                    # Not used in val → free immediately
+                    del ppgs
 
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]
@@ -866,7 +927,7 @@ def main(config_path):
                     attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                     attn_mask = (attn_mask < 1)
 
-                    s2s_attn.masked_fill_(attn_mask, 0.0)
+                    s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
 
                     # --- NEW: sanitize attention + row-renormalize ---
                     s2s_attn = torch.nan_to_num(s2s_attn, nan=0.0, posinf=0.0, neginf=0.0)
@@ -884,6 +945,9 @@ def main(config_path):
                 # acoustic reps: normal and monotonic-fallback
                 asr      = t_en @ s2s_attn
                 asr_mono = t_en @ s2s_attn_mono
+
+                # Attentions no longer needed in val
+                del s2s_attn, s2s_attn_mono, attn_mask
 
                 # get clips
 
@@ -922,10 +986,14 @@ def main(config_path):
 
                     wav_cpu.append(torch.from_numpy(y))
 
-                wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+                wav = torch.stack(wav_cpu).float().pin_memory()
 
                 en = torch.stack(en)
                 en_mono = torch.stack(en_mono_list)
+
+                # Encoder/ASR temps no longer needed in val
+                del asr, asr_mono, t_en
+
                 gt = torch.stack(gt).detach()
 
                 # --- Validation guards: too-short or too-silent windows ---
@@ -983,7 +1051,7 @@ def main(config_path):
                             log_print("[val] still non-finite after fp32; trying monotonic attention fallback", logger)
                             if not logged_mono_shape:
                                 # log shapes to verify the fallback is truly different (and properly transposed)
-                                log_print(f"[val] mono matmul: t_en{tuple(t_en.shape)} @ A{tuple(s2s_attn_mono.shape)} -> en{tuple(en_mono.shape)}", logger)
+                                log_print(f"[val] using monotonic fallback: en_mono{tuple(en_mono.shape)}", logger)
                                 logged_mono_shape = True
                         y_rec = dec_mod(en_mono.float(), F0_real.float(), real_norm.float(), s.float())
                         if not torch.isfinite(y_rec).all():
@@ -992,7 +1060,10 @@ def main(config_path):
                                 log_print("[val] decoder still non-finite after fp32 + monotonic fallback; skipping batch", logger)
                             continue
 
-                loss_mel = stft_loss(y_rec.squeeze().float(), wav.detach())
+                # Compute STFT loss for both paths (finite first-try or after fallback)
+                wav_dev = wav.to(device, non_blocking=True)
+                loss_mel = stft_loss(y_rec.contiguous().squeeze(1).float(), wav_dev.detach())
+                del wav_dev
                 
                 # Skip non-finite losses to avoid poisoning the epoch average
                 loss_mel_g = accelerator.gather(loss_mel).mean()

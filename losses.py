@@ -22,7 +22,13 @@ class SpectralConvergengeLoss(torch.nn.Module):
         Returns:
             Tensor: Spectral convergence loss value.
         """
-        return torch.norm(y_mag - x_mag, p=1) / torch.norm(y_mag, p=1)
+
+        # Guards: finite-only & epsilon in denominator prevents div-by-zero on near-silent targets
+        x_mag = torch.nan_to_num(x_mag, 0.0, 0.0, 0.0)
+        y_mag = torch.nan_to_num(y_mag, 0.0, 0.0, 0.0)
+        num = torch.sum((y_mag - x_mag).abs())
+        den = torch.sum(y_mag.abs()).clamp_min_(1e-6)
+        return num / den
 
 class STFTLoss(torch.nn.Module):
     """STFT loss module."""
@@ -46,13 +52,26 @@ class STFTLoss(torch.nn.Module):
             Tensor: Spectral convergence loss value.
             Tensor: Log STFT magnitude loss value.
         """
+
+        # Shape normaliser: accept [B,1,T] or [B,T] and coerce to [B,T]
+        if x.ndim == 3 and x.size(1) == 1: x = x[:, 0, :]
+        if y.ndim == 3 and y.size(1) == 1: y = y[:, 0, :]
+        # Guards: clamp wave and clean non-finites before STFT
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0).clamp_(-1, 1)
+        y = torch.nan_to_num(y, 0.0, 0.0, 0.0).clamp_(-1, 1)
+
         x_mag = self.to_mel(x)
+
         mean, std = -4, 4
-        x_mag = (torch.log(1e-5 + x_mag) - mean) / std
+
+        x_mag = torch.nan_to_num(torch.log1p(x_mag.clamp_min(0) * (1.0)) , 0.0, 0.0, 0.0)  # safe log
+        x_mag = (x_mag - mean) / std
         
         y_mag = self.to_mel(y)
         mean, std = -4, 4
-        y_mag = (torch.log(1e-5 + y_mag) - mean) / std
+
+        y_mag = torch.nan_to_num(torch.log1p(y_mag.clamp_min(0) * (1.0)) , 0.0, 0.0, 0.0)
+        y_mag = (y_mag - mean) / std
         
         sc_loss = self.spectral_convergenge_loss(x_mag, y_mag)    
         return sc_loss
@@ -88,7 +107,14 @@ class MultiResolutionSTFTLoss(torch.nn.Module):
             Tensor: Multi resolution spectral convergence loss value.
             Tensor: Multi resolution log STFT magnitude loss value.
         """
-        sc_loss = 0.0
+        # Pre-guards (apply once): accept [B,1,T] and sanitise; STFTLoss repeats internally
+        if x.ndim == 3 and x.size(1) == 1: x = x[:, 0, :]
+        if y.ndim == 3 and y.size(1) == 1: y = y[:, 0, :]
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0).clamp_(-1, 1)
+        y = torch.nan_to_num(y, 0.0, 0.0, 0.0).clamp_(-1, 1)
+
+        sc_loss = x.new_tensor(0.0, dtype=torch.float32)
+
         for f in self.stft_losses:
             sc_l = f(x, y)
             sc_loss += sc_l
@@ -118,28 +144,53 @@ def _lastdim_chunk_bounds(L: int, max_chunks: int = 4):
     return bounds
 
 # memory-safe feature matching:
-# - stream across last dimension in chunks
-# - accumulate abs-diff in fp32 and normalize by total elements
+# - accept nested feature-map structures from different D impls
+def _flatten_fmaps(x):
+    """
+    Accepts: tensor, [tensor,...], or [[tensor,...], [tensor,...], ...]
+    Returns: flat list of tensors in order.
+    """
+    if isinstance(x, torch.Tensor):
+        return [x]
+    out = []
+    queue = list(x) if isinstance(x, (list, tuple)) else [x]
+    while queue:
+        cur = queue.pop(0)
+        if isinstance(cur, (list, tuple)):
+            queue = list(cur) + queue
+        else:
+            out.append(cur)
+    return out
+
 def feature_loss(fmap_r, fmap_g, max_chunks: int = 8):
-    total_loss = 0.0
+    total_loss = None
+    dev = None
     for dr, dg in zip(fmap_r, fmap_g):
-        for rl, gl in zip(dr, dg):
+        fr_list = _flatten_fmaps(dr)
+        fg_list = _flatten_fmaps(dg)
+        for rl, gl in zip(fr_list, fg_list):
+            assert isinstance(rl, torch.Tensor) and isinstance(gl, torch.Tensor), "Feature maps must be tensors"
             # shape can be [B,C,T] (MSD/MPD) or [B,C,H,W]; we chunk along the last dim
             assert rl.shape == gl.shape, "Feature map shapes must match"
+            if dev is None:
+                dev = rl.device
             numel  = rl.numel()
             last_L = rl.shape[-1]
 
             # stream over last dimension
             part_sum = rl.new_tensor(0.0, dtype=torch.float32)
             for s, e in _lastdim_chunk_bounds(last_L, max_chunks=max_chunks):
-                r = rl[..., s:e]
-                g = gl[..., s:e]
+                r = torch.nan_to_num(rl[..., s:e], 0.0, 0.0, 0.0)
+                g = torch.nan_to_num(gl[..., s:e], 0.0, 0.0, 0.0)
                 # accumulate in fp32 for numerical stability in bf16 runs
                 part_sum += (g - r).abs().float().sum()
 
             # mean over all elements (same scale as original code)
-            total_loss = total_loss + (part_sum / float(numel))
+            term = (part_sum / float(numel))
+            total_loss = (term if total_loss is None else (total_loss + term))
 
+    if total_loss is None:
+        return torch.tensor(0.0, dtype=torch.float32, device=(dev if dev is not None else torch.device("cpu")))
     return total_loss * 2.0
 
 
@@ -148,8 +199,12 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
     r_losses = []
     g_losses = []
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1-dr)**2)
+
+        dr = torch.nan_to_num(dr, 0.0, 0.0, 0.0).float()
+        dg = torch.nan_to_num(dg, 0.0, 0.0, 0.0).float()
+        r_loss = torch.mean((1 - dr)**2)
         g_loss = torch.mean(dg**2)
+
         loss += (r_loss + g_loss)
         r_losses.append(r_loss.item())
         g_losses.append(g_loss.item())
@@ -161,7 +216,10 @@ def generator_loss(disc_outputs):
     loss = 0
     gen_losses = []
     for dg in disc_outputs:
-        l = torch.mean((1-dg)**2)
+
+        dg = torch.nan_to_num(dg, 0.0, 0.0, 0.0).float()
+        l = torch.mean((1 - dg)**2)
+
         gen_losses.append(l)
         loss += l
 
@@ -171,19 +229,35 @@ def generator_loss(disc_outputs):
 def discriminator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+
         tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
-        loss += tau - F.relu(tau - L_rel)
+        dr = torch.nan_to_num(dr, 0.0, 0.0, 0.0).float()
+        dg = torch.nan_to_num(dg, 0.0, 0.0, 0.0).float()
+        D = (dr - dg)
+        m_DG = torch.nanmedian(D)
+        mask = torch.isfinite(D) & torch.isfinite(m_DG) & (dr < (dg + m_DG))
+        if mask.any():
+            L_rel = torch.mean(((D - m_DG)**2)[mask])
+            loss += tau - F.relu(tau - L_rel)
+        else:
+            loss += 0.0
+
     return loss
 
 def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dg, dr in zip(disc_real_outputs, disc_generated_outputs):
         tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
-        loss += tau - F.relu(tau - L_rel)
+        dr = torch.nan_to_num(dr, 0.0, 0.0, 0.0).float()
+        dg = torch.nan_to_num(dg, 0.0, 0.0, 0.0).float()
+        D = (dr - dg)
+        m_DG = torch.nanmedian(D)
+        mask = torch.isfinite(D) & torch.isfinite(m_DG) & (dr < (dg + m_DG))
+        if mask.any():
+            L_rel = torch.mean(((D - m_DG)**2)[mask])
+            loss += tau - F.relu(tau - L_rel)
+        else:
+            loss += 0.0
     return loss
 
 class GeneratorLoss(torch.nn.Module):
@@ -214,6 +288,9 @@ class GeneratorLoss(torch.nn.Module):
         with torch.inference_mode():
             with self._amp_ctx():
                 y_r, fmap_r = d(y)
+                # Backstop any NaNs from real path to avoid contaminating FM/TPRLS
+                y_r    = torch.nan_to_num(y_r, 0.0, 0.0, 0.0)
+                fmap_r = [ [ torch.nan_to_num(t, 0.0, 0.0, 0.0) for t in fm ] for fm in fmap_r ]
 
         # G-step: we don't update D, so don't build weight grads for D.
         # This keeps gradients flowing to y_hat, but avoids grad state for D's weights.
@@ -225,6 +302,8 @@ class GeneratorLoss(torch.nn.Module):
         try:
             with self._amp_ctx():
                 y_g, fmap_g = d(y_hat)
+                y_g    = torch.nan_to_num(y_g, 0.0, 0.0, 0.0)
+                fmap_g = [ [ torch.nan_to_num(t, 0.0, 0.0, 0.0) for t in fm ] for fm in fmap_g ]
         finally:
             for p, r in zip(d.parameters(), req):
                 if p.requires_grad != r:
@@ -329,6 +408,15 @@ class WavLMLoss(torch.nn.Module):
      
     def forward(self, wav, y_rec):
 
+        # Keep resampler on the same device as inputs, when possible
+        try:
+            self.resample = self.resample.to(wav.device)
+        except Exception:
+            pass
+        # Sanitize inputs before resampling
+        wav   = torch.nan_to_num(wav,   0.0, 0.0, 0.0).clamp_(-1, 1)
+        y_rec = torch.nan_to_num(y_rec, 0.0, 0.0, 0.0).clamp_(-1, 1)
+
         # Real branch: eval/no-grad
         with torch.no_grad():
             wav_16 = self.resample(wav)
@@ -355,15 +443,22 @@ class WavLMLoss(torch.nn.Module):
             return self.wavlm(input_values=inp, output_hidden_states=True).hidden_states
         y_rec_embeddings = checkpoint(_wavlm_hidden, y_rec_16, use_reentrant=False)
 
-        floss = 0
+        floss = 0.0
         for er, eg in zip(wav_embeddings, y_rec_embeddings):
+            er = torch.nan_to_num(er, 0.0, 0.0, 0.0)
+            eg = torch.nan_to_num(eg, 0.0, 0.0, 0.0)
             floss += torch.mean(torch.abs(er - eg))
         
         return floss.mean()
     
     def generator(self, y_rec):
 
-        y_rec_16 = self.resample(y_rec)
+        try:
+            self.resample = self.resample.to(y_rec.device)
+        except Exception:
+            pass
+        y_rec_16 = self.resample(torch.nan_to_num(y_rec, 0.0, 0.0, 0.0).clamp(-1, 1))
+
         if self.slm_max_seconds:
             max_samp = int(self.slm_max_seconds * self.resample.new_freq)
             if y_rec_16.shape[-1] > max_samp:
@@ -373,6 +468,8 @@ class WavLMLoss(torch.nn.Module):
         y_rec_16 = self._as_wavlm_input(y_rec_16)
         y_rec_embeddings = self.wavlm(input_values=y_rec_16,
                                       output_hidden_states=True).hidden_states
+        # sanitize features before WD
+        y_rec_embeddings = [torch.nan_to_num(e, 0.0, 0.0, 0.0) for e in y_rec_embeddings]
 
         y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
         y_df_hat_g = self.wd(y_rec_embeddings)
@@ -381,12 +478,21 @@ class WavLMLoss(torch.nn.Module):
         return loss_gen
     
     def discriminator(self, wav, y_rec):
-        with torch.no_grad():
 
-            wav_16 = self._as_wavlm_input(self.resample(wav))
+        with torch.no_grad():
+            try:
+                self.resample = self.resample.to(wav.device)
+            except Exception:
+                pass
+
+            wav_16 = self._as_wavlm_input(self.resample(torch.nan_to_num(wav, 0.0, 0.0, 0.0).clamp(-1, 1)))
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-            y_rec_16 = self._as_wavlm_input(self.resample(y_rec))
+            y_rec_16 = self._as_wavlm_input(self.resample(torch.nan_to_num(y_rec, 0.0, 0.0, 0.0).clamp(-1, 1)))
             y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
+
+            # sanitize features before WD
+            wav_embeddings   = [torch.nan_to_num(e, 0.0, 0.0, 0.0) for e in wav_embeddings]
+            y_rec_embeddings = [torch.nan_to_num(e, 0.0, 0.0, 0.0) for e in y_rec_embeddings]
 
             y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
             y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)

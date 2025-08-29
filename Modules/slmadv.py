@@ -7,6 +7,10 @@ class SLMAdversarialLoss(torch.nn.Module):
     def __init__(self, model, wl, sampler, min_len, max_len, batch_percentage=0.5, skip_update=10, sig=1.5):
         super(SLMAdversarialLoss, self).__init__()
         self.model = model
+
+        # noise scale for sampler/predictor (keeps stochasticity but tames outliers)
+        self.noise_sigma = 0.2
+
         self.wl = wl
         self.sampler = sampler
         
@@ -14,7 +18,8 @@ class SLMAdversarialLoss(torch.nn.Module):
         self.max_len = max_len
         self.batch_percentage = batch_percentage
         
-        self.sig = sig
+        # enforce a small positive floor for sigma to avoid 1/sig^2 blow-ups
+        self.sig = max(sig, 1e-2)
         self.skip_update = skip_update
         
     def forward(self, iters, y_rec_gt, y_rec_gt_pred, waves, mel_input_length, ref_text, ref_lengths, use_ind, s_trg, ref_s=None):
@@ -27,14 +32,14 @@ class SLMAdversarialLoss(torch.nn.Module):
         else:
             num_steps = np.random.randint(3, 5)
             if ref_s is not None:
-                s_preds = self.sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(ref_text.device), 
+                s_preds = self.sampler(noise = (self.noise_sigma * torch.randn_like(s_trg)).unsqueeze(1).to(ref_text.device),
                       embedding=bert_dur,
                       embedding_scale=1,
                                features=ref_s, # reference from the same speaker as the embedding
                          embedding_mask_proba=0.1,
                          num_steps=num_steps).squeeze(1)
             else:
-                s_preds = self.sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(ref_text.device), 
+                s_preds = self.sampler(noise = (self.noise_sigma * torch.randn_like(s_trg)).unsqueeze(1).to(ref_text.device), 
                       embedding=bert_dur,
                       embedding_scale=1,
                          embedding_mask_proba=0.1,
@@ -45,7 +50,7 @@ class SLMAdversarialLoss(torch.nn.Module):
         
         d, _ = self.model.predictor(d_en, s_dur, 
                                                 ref_lengths, 
-                                                torch.randn(ref_lengths.shape[0], ref_lengths.max(), 2).to(ref_text.device), 
+                                                (self.noise_sigma * torch.randn(ref_lengths.shape[0], ref_lengths.max(), 2)).to(ref_text.device), 
                                                 text_mask)
         
         bib = 0
@@ -62,20 +67,31 @@ class SLMAdversarialLoss(torch.nn.Module):
             _dur_pred = _s2s_pred.sum(axis=-1)
 
             l = int(torch.round(_s2s_pred.sum()).item())
-            t = torch.arange(0, l).expand(l)
 
             t = torch.arange(0, l).unsqueeze(0).expand((len(_s2s_pred), l)).to(ref_text.device)
             loc = torch.cumsum(_dur_pred, dim=0) - _dur_pred / 2
 
             h = torch.exp(-0.5 * torch.square(t - (l - loc.unsqueeze(-1))) / (self.sig)**2)
 
-            out = torch.nn.functional.conv1d(_s2s_pred_org.unsqueeze(0), 
-                                         h.unsqueeze(1), 
-                                         padding=h.shape[-1] - 1, groups=int(_text_length))[..., :l]
+            # Pre-guard: avoid grouped conv with groups=0 or l<1
+            if int(_text_length.item()) < 1 or l < 1:
+                continue
+
+            out = torch.nn.functional.conv1d(
+                _s2s_pred_org.unsqueeze(0),
+                h.unsqueeze(1),
+                padding=h.shape[-1] - 1, groups=int(_text_length)
+            )[..., :l]
+
+            out = torch.nan_to_num(out, 0.0, 0.0, 0.0).clamp_(-30, 30)
+
             attn_preds.append(F.softmax(out.squeeze(), dim=0))
 
             output_lengths.append(l)
 
+        # If everything in this minibatch was skipped, exit early
+        if not output_lengths:
+            return None
         max_len = max(output_lengths)
         
         with torch.no_grad():
@@ -133,6 +149,11 @@ class SLMAdversarialLoss(torch.nn.Module):
         wav = torch.stack(wav).float()
         en = torch.stack(en)
         p_en = torch.stack(p_en)
+        # Sanitize stacked tensors
+        sp = torch.nan_to_num(sp, 0.0, 0.0, 0.0)
+        wav = torch.nan_to_num(wav, 0.0, 0.0, 0.0).clamp_(-1, 1)
+        en = torch.nan_to_num(en, 0.0, 0.0, 0.0)
+        p_en = torch.nan_to_num(p_en, 0.0, 0.0, 0.0)
         
         F0_fake, N_fake = self.model.predictor.F0Ntrain(p_en, sp[:, 128:])
         y_pred = self.model.decoder(en, F0_fake, N_fake, sp[:, :128])
@@ -149,36 +170,52 @@ class SLMAdversarialLoss(torch.nn.Module):
             if use_rec: # use reconstructed (shorter lengths), do length invariant regularization
                 if wav.size(-1) > y_pred.size(-1):
                     real_GP = wav[:, : , :crop_size]
-                    out_crop = self.wl.discriminator_forward(real_GP.detach().squeeze())
-                    out_org = self.wl.discriminator_forward(wav.detach().squeeze())
+
+                    out_crop = self.wl.discriminator_forward(
+                        torch.nan_to_num(real_GP.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                    )
+                    out_org  = self.wl.discriminator_forward(
+                        torch.nan_to_num(wav.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                    )
+
                     loss_reg = F.l1_loss(out_crop, out_org[..., :out_crop.size(-1)])
 
-                    if np.random.randint(0, 2) == 0:
-                        d_loss = self.wl.discriminator(real_GP.detach().squeeze(), y_pred.detach().squeeze()).mean()
-                    else:
-                        d_loss = self.wl.discriminator(wav.detach().squeeze(), y_pred.detach().squeeze()).mean()
+                    d_loss = self.wl.discriminator(
+                        torch.nan_to_num(real_GP.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1),
+                        torch.nan_to_num(y_pred.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                    ).mean()
+
                 else:
                     real_GP = y_pred[:, : , :crop_size]
-                    out_crop = self.wl.discriminator_forward(real_GP.detach().squeeze())
-                    out_org = self.wl.discriminator_forward(y_pred.detach().squeeze())
+
+                    out_crop = self.wl.discriminator_forward(torch.nan_to_num(real_GP.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1))
+                    out_org  = self.wl.discriminator_forward(torch.nan_to_num(y_pred.detach().squeeze(),   0.0, 0.0, 0.0).clamp(-1, 1))
+
                     loss_reg = F.l1_loss(out_crop, out_org[..., :out_crop.size(-1)])
 
-                    if np.random.randint(0, 2) == 0:
-                        d_loss = self.wl.discriminator(wav.detach().squeeze(), real_GP.detach().squeeze()).mean()
-                    else:
-                        d_loss = self.wl.discriminator(wav.detach().squeeze(), y_pred.detach().squeeze()).mean()
+                    d_loss = self.wl.discriminator(
+                        torch.nan_to_num(wav.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1),
+                        torch.nan_to_num(real_GP.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                    ).mean()
                 
                 # regularization (ignore length variation)
                 d_loss += loss_reg
 
-                out_gt = self.wl.discriminator_forward(y_rec_gt.detach().squeeze())
-                out_rec = self.wl.discriminator_forward(y_rec_gt_pred.detach().squeeze())
+                out_gt = self.wl.discriminator_forward(
+                    torch.nan_to_num(y_rec_gt.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                )
+                out_rec = self.wl.discriminator_forward(
+                    torch.nan_to_num(y_rec_gt_pred.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                )
 
                 # regularization (ignore reconstruction artifacts)
                 d_loss += F.l1_loss(out_gt, out_rec)
 
             else:
-                d_loss = self.wl.discriminator(wav.detach().squeeze(), y_pred.detach().squeeze()).mean()
+                d_loss = self.wl.discriminator(
+                    torch.nan_to_num(wav.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1),
+                    torch.nan_to_num(y_pred.detach().squeeze(), 0.0, 0.0, 0.0).clamp(-1, 1)
+                ).mean()
         else:
             d_loss = 0
             

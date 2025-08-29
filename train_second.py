@@ -20,6 +20,8 @@ import traceback
 import warnings
 warnings.simplefilter('ignore')
 
+from torch.utils.checkpoint import checkpoint
+
 import copy
 import os.path as osp
 from datetime import timedelta
@@ -235,6 +237,17 @@ def main(config_path):
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
 
+    # ---- Strict FP32 numerics & stable algorithm choices ----
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    try:
+        # FP32 path → prefer mem_efficient + math (flash kernels are off in FP32)
+        from torch.backends.cuda import sdp_kernel
+        sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True)
+    except Exception:
+        pass
+    logger.info("[prec] FP32 only | TF32=False | cudnn.benchmark=False | SDPA=mem_efficient")
 
     batch_size = config.get('batch_size', 10)
     grad_accum = int(config.get('grad_accum', 4))    
@@ -367,6 +380,28 @@ def main(config_path):
         if k in model:
             _flatten_rnns(getattr(model, k) if hasattr(model, k) else model[k])
 
+    # Best-effort: enable ckpt inside diffusion UNet blocks if the API exists
+    try:
+        _core = _get_diffusion_core(model)
+        enabled = 0
+        for m in _core.modules():
+            if hasattr(m, "enable_gradient_checkpointing"):
+                try:
+                    m.enable_gradient_checkpointing()
+                    enabled += 1
+                except Exception:
+                    pass
+            elif hasattr(m, "gradient_checkpointing"):
+                try:
+                    m.gradient_checkpointing = True
+                    enabled += 1
+                except Exception:
+                    pass
+        if enabled > 0:
+            logger.info(f"[ckpt] diffusion: enabled ckpt on {enabled} sub-modules")
+    except Exception as e:
+        logger.info(f"[ckpt] diffusion: no gradient-ckpt hooks found ({e})")
+
 
     # ---- EMA & GA configs ----
     ema_cfg = Munch(config.get("ema", {
@@ -415,7 +450,7 @@ def main(config_path):
             raise ValueError('You need to specify the path to the first stage model.') 
 
     fm_chunks = int(config.get("fm_max_chunks", 8))
-    gl = GeneratorLoss(model.mpd, model.msd, fm_max_chunks=fm_chunks).to(device)
+    gl = GeneratorLoss(model.mpd, model.msd, fm_max_chunks=fm_chunks, amp_mode="fp32", amp_enabled=False).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, 
                    model.wd, 
@@ -672,24 +707,29 @@ def main(config_path):
                         ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
                         ref = torch.cat([ref_ss, ref_sp], dim=1)
 
-                # compute the style of the entire utterance
-                # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-                ss = []
-                gs = []
-                for bib in range(len(mel_input_length)):
-                    mel_length = int(mel_input_length[bib].item())
-                    mel = mels[bib, :, :mel_input_length[bib]]
-                    s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                    ss.append(s)
-                    s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                    gs.append(s)
+                # compute the style of the entire utterance (no grads needed; s_trg is detached)
+                # doing this under no_grad trims graph/VRAM with zero training signal change
+                ss = []; gs = []
+                with torch.no_grad():
+                    for bib in range(len(mel_input_length)):
+                        mel_length = int(mel_input_length[bib].item())
+                        mel = mels[bib, :, :mel_input_length[bib]]
+                        s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
+                        ss.append(s)
+                        s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
+                        gs.append(s)
 
                 s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
                 gs = torch.stack(gs).squeeze(1) # global acoustic styles
                 s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
-                bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-                d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+                # BERT stack tends to be memory hungry → checkpoint both calls
+                bert_dur = checkpoint(
+                    lambda T, M: model.bert(T, attention_mask=M),
+                    texts, (~text_mask).int()
+                )
+                d_en = checkpoint(lambda X: model.bert_encoder(X),
+                                  bert_dur).transpose(-1, -2)
                 
                 # denoiser training
                 if epoch >= diff_epoch:
@@ -711,6 +751,7 @@ def main(config_path):
                         _edm = _get_diffusion_core(model)
                         loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
                         loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                        del s_preds
                     else:
                         s_preds = train_sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
                             embedding=bert_dur,
@@ -721,14 +762,22 @@ def main(config_path):
                         _edm = _get_diffusion_core(model)
                         loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur).mean()
                         loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                        del s_preds
                 else:
                     loss_sty = 0
                     loss_diff = 0
 
-                d, p = model.predictor(d_en, s_dur, 
-                                                        input_lengths, 
-                                                        s2s_attn_mono, 
-                                                        text_mask)
+                # predictor heads (duration/noise) → big enough to benefit from ckpt
+                d, p = checkpoint(
+                    lambda A, B, C, D, E: model.predictor(A, B, C, D, E),
+                    d_en, s_dur, input_lengths, s2s_attn_mono, text_mask
+                )
+
+                # free alignments before heavy decoder/adv work
+                try:
+                    del s2s_attn_mono, s2s_attn, attn_mask
+                except Exception:
+                    pass
                 
                 mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
                 mel_len_st = int(mel_input_length.min().item() / 2 - 1)
@@ -754,7 +803,8 @@ def main(config_path):
                     random_start = np.random.randint(0, mel_length - mel_len_st)
                     st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
                     
-                wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+                # Keep on CPU (pinned); move cropped/short-lived copies later
+                wav = torch.stack(wav_cpu).float().pin_memory()
 
                 en = torch.stack(en)
                 p_en = torch.stack(p_en)
@@ -764,9 +814,12 @@ def main(config_path):
                 if gt.size(-1) < 80:
                     continue
 
-                s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                s_inp = (st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                # predictor/style encoders feed decoder → checkpoint them
+                s_dur = checkpoint(lambda X: model.predictor_encoder(X), s_inp)
+
                 dt_pred = _t.perf_counter() - _t2; _t3 = _t.perf_counter()
-                s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                s  = checkpoint(lambda X: model.style_encoder(X), s_inp)
                 dt_style = _t.perf_counter() - _t3; _t4 = _t.perf_counter()
                 # sanitize style vectors
                 s = torch.nan_to_num(s, 0.0, 0.0, 0.0)
@@ -796,7 +849,13 @@ def main(config_path):
                 en = torch.nan_to_num(en, 0.0, 0.0, 0.0)
                 F0_fake = torch.nan_to_num(F0_fake, 0.0, 0.0, 0.0)
                 N_fake = torch.nan_to_num(N_fake, 0.0, 0.0, 0.0)
-                y_rec = model.decoder(en, F0_fake, N_fake, s)
+                
+                # decoder is the main hog → checkpoint it
+                y_rec = checkpoint(
+                    lambda A, B, C, D: model.decoder(A, B, C, D),
+                    en, F0_fake, N_fake, s
+                )
+                
                 dt_dec = _t.perf_counter() - _t5; _t6 = _t.perf_counter()
                 if not torch.isfinite(y_rec).all():
                     logger.info("[train] non-finite decoder output; skipping batch")
@@ -816,6 +875,18 @@ def main(config_path):
 
                     # Use fully detached, cropped, sanitised reals/fakes for D
                     _y_real_adv, _y_fake_adv = _prep_adv_pair(wav.detach(), y_rec.detach(), ADV_MAX_SAMPLES)
+                    # real slice is CPU → move just this cropped window to GPU
+                    _y_real_adv = _y_real_adv.to(device, non_blocking=True)
+
+                    # --- one-liner: report chosen crop length for D path ---
+                    try:
+                        if ((i + 1) % max(1, log_interval) == 0):
+                            T0 = int(min(wav.size(-1), y_rec.size(-1)))
+                            Tc = int(_y_real_adv.size(-1))
+                            logger.info(f"[adv] D: crop={Tc}/{T0} samples (cap={ADV_MAX_SAMPLES})")
+                    except Exception:
+                        pass
+
                     d_loss = dl(_y_real_adv, _y_fake_adv).mean().float()
                     if not torch.isfinite(d_loss):
                         logger.info("[skip] non-finite d_loss; skipping D backward for this batch")
@@ -835,16 +906,40 @@ def main(config_path):
 
                 # -------- Generator losses (accumulate) --------
 
-                loss_mel = stft_loss(y_rec.float(), wav.float())
+                # short-lived GPU copy for STFT; keeps full 'wav' on CPU
+                _wav_dev = wav.to(device, non_blocking=True)
+                # STFT accepts [B,T]; squeeze channel dim if present
+                y_for_stft = (y_rec[:, 0, :] if (y_rec.dim() == 3 and y_rec.size(1) == 1) else y_rec)
+                loss_mel = stft_loss(y_for_stft.float(), _wav_dev.float())
+
+                del _wav_dev
+
                 dt_stft = _t.perf_counter() - _t7 if start_ds else _t.perf_counter() - _t6
 
                 if start_ds:
                     # Cropped/sanitised window for G's adv/FM too (bounds MSD/MPD memory)
                     _y_real_adv_g, _y_fake_adv_g = _prep_adv_pair(wav, y_rec, ADV_MAX_SAMPLES)
+                    _y_real_adv_g = _y_real_adv_g.to(device, non_blocking=True)
+
+                    # --- one-liner: report chosen crop length for G path ---
+                    try:
+                        if ((i + 1) % max(1, log_interval) == 0):
+                            T0 = int(min(wav.size(-1), y_rec.size(-1)))
+                            Tc = int(_y_real_adv_g.size(-1))
+                            logger.info(f"[adv] G: crop={Tc}/{T0} samples (cap={ADV_MAX_SAMPLES})")
+                    except Exception:
+                        pass
+
                     loss_gen_all = gl(_y_real_adv_g, _y_fake_adv_g).mean()
                 else:
                     loss_gen_all = 0
-                loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+
+                # short-lived GPU copy for SLM (WavLM)
+                _wav_slm = wav.to(device, non_blocking=True)
+
+                # _wav_slm is [B,T]; keep as-is. y_rec is [B,1,T] → squeeze channel only.
+                loss_lm = wl(_wav_slm.detach(), y_rec.squeeze(1)).mean()
+                del _wav_slm
 
                 loss_ce = 0
                 loss_dur = 0
@@ -874,12 +969,12 @@ def main(config_path):
                         loss_params.lambda_diff * loss_diff
 
                 running_loss += loss_mel.item()
+                # Guard first: never backprop a non-finite objective
+                if not torch.isfinite(g_loss):
+                    logger.info("[skip] non-finite g_loss; skipping gradients for this batch")
+                    continue
                 (g_loss / max(1, acc_steps)).backward()
                 dt_bwd = _t.perf_counter() - (_t7 if start_ds else _t6)
-
-                if torch.isnan(g_loss):
-                    from IPython.core.debugger import set_trace
-                    set_trace()
 
                 # -------- Step at GA boundary --------
                 if step_boundary:
@@ -1236,10 +1331,17 @@ def main(config_path):
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-                    d, p = model.predictor(d_en, s, 
-                                                        input_lengths, 
-                                                        s2s_attn_mono, 
-                                                        text_mask)
+                    d, p = model.predictor(d_en, s,
+                                           input_lengths,
+                                           s2s_attn_mono,
+                                           text_mask)
+                    # alignments no longer needed for val → free now
+                    try:
+                        del s2s_attn_mono, s2s_attn, attn_mask
+                    except Exception:
+                        pass
+
+
                     # get clips
                     mel_len = int(mel_input_length.min().item() / 2 - 1)
                     en = []
@@ -1264,7 +1366,8 @@ def main(config_path):
                         y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
                         wav_cpu.append(torch.from_numpy(y))
 
-                    wav = torch.stack(wav_cpu).float().pin_memory().to(device, non_blocking=True)
+                    # Keep CPU-pinned; move a short-lived copy only for STFT
+                    wav = torch.stack(wav_cpu).float().pin_memory()
 
                     en = torch.stack(en)
                     en_mono = torch.stack(en_mono_list)
@@ -1318,7 +1421,9 @@ def main(config_path):
                                 # skip batch — don’t poison val average
                                 continue
 
-                    loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                    _wav_dev = wav.to(device, non_blocking=True)
+                    loss_mel = stft_loss(y_rec.squeeze(1), _wav_dev.detach())
+                    del _wav_dev
 
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 
 

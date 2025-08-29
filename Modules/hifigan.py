@@ -65,10 +65,12 @@ class AdaINResBlock1(torch.nn.Module):
     def forward(self, x, s):
         for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
             xt = n1(x, s)
-            xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
+            inv_a1 = (a1.abs() + 1e-4).reciprocal()
+            xt = xt + inv_a1 * (torch.sin(a1 * xt) ** 2)  # Snake1D (safe)
             xt = c1(xt)
             xt = n2(xt, s)
-            xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D
+            inv_a2 = (a2.abs() + 1e-4).reciprocal()
+            xt = xt + inv_a2 * (torch.sin(a2 * xt) ** 2)  # Snake1D (safe)
             xt = c2(xt)
             x = xt + x
         return x
@@ -326,7 +328,9 @@ class Generator(torch.nn.Module):
         har_source = har_source.transpose(1, 2)
         
         for i in range(self.num_upsamples):
-            x = x + (1 / self.alphas[i]) * (torch.sin(self.alphas[i] * x) ** 2)
+            inv_ai = (self.alphas[i].abs() + 1e-4).reciprocal()
+            x = x + inv_ai * (torch.sin(self.alphas[i] * x) ** 2)  # Snake1D (safe)
+            x = torch.nan_to_num(x, 0.0, 0.0, 0.0)
             x_source = self.noise_convs[i](har_source)
             x_source = self.noise_res[i](x_source, s)
             
@@ -340,9 +344,14 @@ class Generator(torch.nn.Module):
                 else:
                     xs += self.resblocks[i*self.num_kernels+j](x, s)
             x = xs / self.num_kernels
-        x = x + (1 / self.alphas[i+1]) * (torch.sin(self.alphas[i+1] * x) ** 2)
+
+        inv_ai1 = (self.alphas[i+1].abs() + 1e-4).reciprocal()
+        x = x + inv_ai1 * (torch.sin(self.alphas[i+1] * x) ** 2)   # Snake1D (safe)
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0)
+
         x = self.conv_post(x)
         x = torch.tanh(x)
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0).clamp_(-1, 1)
 
         return x
 

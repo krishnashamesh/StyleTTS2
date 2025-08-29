@@ -116,7 +116,7 @@ def build_optimizer(parameters_dict, scheduler_params_dict, lr, impl: str = "tor
             else:
                 # B) Paged 8-bit AdamW – optimizer states mostly in host, lower VRAM, some slowdown
                 min8 = int(os.environ.get("BNB_MIN_8BIT_SIZE", "65536"))
-                opt = bnb.optim.AdamW8bit(params, lr=lr, weight_decay=1e-4,
+                opt = bnb.optim.PagedAdamW8bit(params, lr=lr, weight_decay=1e-4,
                                           betas=(0.0, 0.99), eps=1e-9,
                                           min_8bit_size=min8)
                 optim[key] = opt

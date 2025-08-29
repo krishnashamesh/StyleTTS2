@@ -15,12 +15,14 @@ def stft(x, fft_size, hop_size, win_length, window):
         fft_size (int): FFT size.
         hop_size (int): Hop size.
         win_length (int): Window length.
-        window (str): Window function type.
+        window (Tensor): Window tensor (on same device as input)
     Returns:
         Tensor: Magnitude spectrogram (B, #frames, fft_size // 2 + 1).
     """
     x_stft = torch.stft(x, fft_size, hop_size, win_length, window, return_complex=True)
-    return x_stft.abs().transpose(2, 1)
+    # Guard: quarantine NaNs/Infs coming from unusual inputs or window/device mismatch
+    mag = torch.nan_to_num(x_stft.abs(), 0.0, 0.0, 0.0)
+    return mag.transpose(2, 1)
 
 class SpecDiscriminator(nn.Module):
     """docstring for Discriminator."""
@@ -46,7 +48,11 @@ class SpecDiscriminator(nn.Module):
 
         fmap = []
         y = y.squeeze(1)
+
         y = stft(y, self.fft_size, self.shift_size, self.win_length, self.window.to(y.device))
+        # Backstop: ensure finite spectrogram before convs (cheap & safe)
+        y = torch.nan_to_num(y, 0.0, 0.0, 0.0)
+
         # NHWC activations reduce workspace needs on Ada/Lovelace
         y = y.unsqueeze(1).contiguous(memory_format=torch.channels_last)
         for i, d in enumerate(self.discriminators):
@@ -106,6 +112,8 @@ class DiscriminatorP(torch.nn.Module):
 
     def forward(self, x):
         fmap = []
+        # Guard: waveform in [-1,1] and finite
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0).clamp_(-1, 1)
 
         # 1d to 2d
         b, c, t = x.shape
@@ -173,6 +181,8 @@ class WavLMDiscriminator(nn.Module):
         self.conv_post = norm_f(Conv1d(initial_channel * 4, 1, 3, 1, padding=1))
         
     def forward(self, x):
+        # Guard: SLM feature maps often carry rare NaNs after long crops
+        x = torch.nan_to_num(x, 0.0, 0.0, 0.0)
         x = self.pre(x)
         
         fmap = []
