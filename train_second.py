@@ -314,7 +314,7 @@ def main(config_path):
         batch_size=batch_size,
         validation=True,
         num_workers=nw,
-        prefetch_factor=8,
+        prefetch_factor=16,
         persistent_workers=True,
         dataset_config=ds_cfg,
         device=device
@@ -568,24 +568,34 @@ def main(config_path):
     def _prep_adv_pair(y_real, y_fake, max_samples: int):
         """
         Returns (real, fake) cropped & sanitised for MSD/MPD.
-        Input may be [B, T] or [B,1,T]. Output is [B,1,T_crop].
+        Input may be [B,T] or [B,1,T]. Output is [B,1,T_crop], plus (Ttot, Tc).
+        Mirrors train_first.py semantics to avoid ckpt metadata mismatch.
         """
-        # to [B, T]
+        # → [B,T]
         if y_real.dim() == 3 and y_real.size(1) == 1: y_real = y_real[:, 0, :]
         if y_fake.dim() == 3 and y_fake.size(1) == 1: y_fake = y_fake[:, 0, :]
         if y_real.dim() != 2 or y_fake.dim() != 2:
             raise RuntimeError(f"adv pair expects [B,T] or [B,1,T]; got real={tuple(y_real.shape)} fake={tuple(y_fake.shape)}")
-        T = min(y_real.size(-1), y_fake.size(-1))
-        if T > max_samples:
+        Ttot = min(y_real.size(-1), y_fake.size(-1))
+        Tc   = min(Ttot, int(max_samples))
+        if Tc < Ttot:
             import numpy as _np
-            s0 = int(_np.random.randint(0, T - max_samples + 1))
-            s1 = s0 + max_samples
-            y_real = y_real[:, s0:s1]
-            y_fake = y_fake[:, s0:s1]
-        # sanitise waveforms to avoid cascading NaNs/Inf
-        y_real = torch.nan_to_num(y_real, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
-        y_fake = torch.nan_to_num(y_fake, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
-        return y_real.unsqueeze(1), y_fake.unsqueeze(1)
+            s0 = int(_np.random.randint(0, Ttot - Tc + 1)); s1 = s0 + Tc
+            # clone slices so they don't alias checkpointed storages
+            y_real = y_real[:, s0:s1].clone()
+            y_fake = y_fake[:, s0:s1].clone()
+        else:
+            # even without cropping, sever aliasing
+            y_real = y_real.clone()
+            y_fake = y_fake.clone()
+        # out-of-place sanitize (no trailing underscores)
+        y_real = torch.nan_to_num(y_real, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        y_fake = torch.nan_to_num(y_fake, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        return (
+            y_real.unsqueeze(1).contiguous(),
+            y_fake.unsqueeze(1).contiguous(),
+            Ttot, Tc
+        )
 
     # GA state
     acc_steps = start_ga
@@ -685,7 +695,7 @@ def main(config_path):
                     attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
                     attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                     attn_mask = (attn_mask < 1)
-                    s2s_attn.masked_fill_(attn_mask, 0.0)
+                    s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
                     s2s_attn = torch.nan_to_num(s2s_attn, 0.0, 0.0, 0.0)
                     row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                     s2s_attn = s2s_attn / row_sum
@@ -850,11 +860,21 @@ def main(config_path):
                 F0_fake = torch.nan_to_num(F0_fake, 0.0, 0.0, 0.0)
                 N_fake = torch.nan_to_num(N_fake, 0.0, 0.0, 0.0)
                 
-                # decoder is the main hog → checkpoint it
+                # decoder is the main hog → checkpoint it (Stage-1 parity: clone inputs/outputs)
+                en_c = en.contiguous().clone()
+                f0_c = F0_fake.contiguous().clone()
+                n_c  = N_fake.contiguous().clone()
+                s_c  = s.contiguous().clone()
                 y_rec = checkpoint(
                     lambda A, B, C, D: model.decoder(A, B, C, D),
-                    en, F0_fake, N_fake, s
+                    en_c, f0_c, n_c, s_c
                 )
+                # IMPORTANT: sever any alias to checkpointed storage (output)
+                y_rec = y_rec.clone().contiguous()
+                try:
+                    del en_c, f0_c, n_c, s_c
+                except Exception:
+                    pass
                 
                 dt_dec = _t.perf_counter() - _t5; _t6 = _t.perf_counter()
                 if not torch.isfinite(y_rec).all():
@@ -873,17 +893,14 @@ def main(config_path):
                     for k in ("decoder","style_encoder","predictor","predictor_encoder","diffusion","bert","bert_encoder"):
                         if k in model: _set_requires_grad(model[k], False)
 
-                    # Use fully detached, cropped, sanitised reals/fakes for D
-                    _y_real_adv, _y_fake_adv = _prep_adv_pair(wav.detach(), y_rec.detach(), ADV_MAX_SAMPLES)
-                    # real slice is CPU → move just this cropped window to GPU
+                    # Use fully detached, cropped, sanitised reals/fakes for D (Stage-1 parity)
+                    _y_real_adv, _y_fake_adv, Ttot, Tc = _prep_adv_pair(wav.detach(), y_rec.detach(), ADV_MAX_SAMPLES)
                     _y_real_adv = _y_real_adv.to(device, non_blocking=True)
 
                     # --- one-liner: report chosen crop length for D path ---
                     try:
                         if ((i + 1) % max(1, log_interval) == 0):
-                            T0 = int(min(wav.size(-1), y_rec.size(-1)))
-                            Tc = int(_y_real_adv.size(-1))
-                            logger.info(f"[adv] D: crop={Tc}/{T0} samples (cap={ADV_MAX_SAMPLES})")
+                            logger.info(f"[adv] D: crop={int(Tc)}/{int(Ttot)} samples (cap={ADV_MAX_SAMPLES})")
                     except Exception:
                         pass
 
@@ -906,27 +923,25 @@ def main(config_path):
 
                 # -------- Generator losses (accumulate) --------
 
-                # short-lived GPU copy for STFT; keeps full 'wav' on CPU
+                # short-lived GPU copy for STFT; Stage-1 parity squeeze(1)
                 _wav_dev = wav.to(device, non_blocking=True)
-                # STFT accepts [B,T]; squeeze channel dim if present
-                y_for_stft = (y_rec[:, 0, :] if (y_rec.dim() == 3 and y_rec.size(1) == 1) else y_rec)
-                loss_mel = stft_loss(y_for_stft.float(), _wav_dev.float())
-
+                loss_mel = stft_loss(
+                    y_rec.contiguous().squeeze(1).float(),
+                    _wav_dev.float()
+                )
                 del _wav_dev
 
                 dt_stft = _t.perf_counter() - _t7 if start_ds else _t.perf_counter() - _t6
 
                 if start_ds:
                     # Cropped/sanitised window for G's adv/FM too (bounds MSD/MPD memory)
-                    _y_real_adv_g, _y_fake_adv_g = _prep_adv_pair(wav, y_rec, ADV_MAX_SAMPLES)
+                    _y_real_adv_g, _y_fake_adv_g, Ttot, Tc = _prep_adv_pair(wav, y_rec, ADV_MAX_SAMPLES)
                     _y_real_adv_g = _y_real_adv_g.to(device, non_blocking=True)
 
                     # --- one-liner: report chosen crop length for G path ---
                     try:
                         if ((i + 1) % max(1, log_interval) == 0):
-                            T0 = int(min(wav.size(-1), y_rec.size(-1)))
-                            Tc = int(_y_real_adv_g.size(-1))
-                            logger.info(f"[adv] G: crop={Tc}/{T0} samples (cap={ADV_MAX_SAMPLES})")
+                            logger.info(f"[adv] G: crop={int(Tc)}/{int(Ttot)} samples (cap={ADV_MAX_SAMPLES})")
                     except Exception:
                         pass
 
@@ -1297,7 +1312,7 @@ def main(config_path):
                         attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
                         attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                         attn_mask = (attn_mask < 1)
-                        s2s_attn.masked_fill_(attn_mask, 0.0)
+                        s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
                         s2s_attn = torch.nan_to_num(s2s_attn, nan=0.0, posinf=0.0, neginf=0.0)
                         row_sum = s2s_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                         s2s_attn = s2s_attn / row_sum
@@ -1422,7 +1437,7 @@ def main(config_path):
                                 continue
 
                     _wav_dev = wav.to(device, non_blocking=True)
-                    loss_mel = stft_loss(y_rec.squeeze(1), _wav_dev.detach())
+                    loss_mel = stft_loss(y_rec.contiguous().squeeze(1), _wav_dev.detach())
                     del _wav_dev
 
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 
