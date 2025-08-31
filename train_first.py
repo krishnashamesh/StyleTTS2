@@ -198,6 +198,12 @@ def main(config_path):
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
 
+    if accelerator.is_main_process:
+        tr_cnt, tr_bad = _summarize_speakers(train_list)
+        va_cnt, va_bad = _summarize_speakers(val_list)
+        log_print(f"[spk] train unique={len(tr_cnt)} bad_defaulted={tr_bad} top={tr_cnt.most_common(5)}", logger)
+        log_print(f"[spk]  val  unique={len(va_cnt)} bad_defaulted={va_bad} top={va_cnt.most_common(5)}", logger)
+
     #Performance improvement
     nw = min(32, os.cpu_count() or 8)
 
@@ -427,7 +433,8 @@ def main(config_path):
             waves = batch[0]
             _log_free('pre_h2d', iters)
             batch = [b.to(device, non_blocking=True) for b in batch[1:]]
-            texts, input_lengths, _, _, mels, mel_input_length, _ = batch
+            # Consume reference fields too (already provided by the dataloader)
+            texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
             
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
@@ -573,7 +580,16 @@ def main(config_path):
             else:
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
             
-            s_inp = st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+            # Multi-speaker: **use the reference mel** (entire utterance) for style.
+            # Fallback to the in-batch style window if for any reason ref_mels is missing.
+            if multispeaker:
+                _use_ref = (isinstance(ref_mels, torch.Tensor) and ref_mels.numel() > 0)
+                s_src = (ref_mels if _use_ref else st)
+                if (not _use_ref) and accelerator.is_main_process and ((i + 1) % max(1, log_interval) == 0):
+                    log_print("[ms] ref_mels missing; fell back to st window for style", logger)
+                s_inp = s_src.unsqueeze(1)
+            else:
+                s_inp = gt.unsqueeze(1)
             # Save ~10–20% VRAM in this block (≈3–8% time overhead)
             s = checkpoint(lambda X: model.style_encoder(X), s_inp, use_reentrant=False)
 
@@ -1218,6 +1234,19 @@ def _nearest_bucket_full_frames(full_frames: int) -> int:
     # Clamp and snap to nearest canonical length (frames)
     full_frames = max(64, min(BUCKETS[-1], int(full_frames)))
     return min(BUCKETS, key=lambda b: abs(b - full_frames))
+
+def _summarize_speakers(lines):
+    from collections import Counter
+    counts = Counter(); bad = 0
+    for ln in lines:
+        parts = str(ln).strip().split('|')
+        if len(parts) >= 3:
+            try:
+                sid = int(parts[2])
+            except Exception:
+                sid = 0; bad += 1
+            counts[sid] += 1
+    return counts, bad
 
 if __name__=="__main__":
     try:

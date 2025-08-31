@@ -9,6 +9,8 @@ random.seed(0)
 import numpy as np
 np.random.seed(0)
 
+import os, pathlib
+
 import nltk
 nltk.download('punkt')
 nltk.download('punkt_tab')
@@ -38,6 +40,14 @@ os.makedirs(out_dir, exist_ok=True)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Env hooks
+#  - REF_WAV: single path (backward compatible)
+#  - REF_WAVS: comma/whitespace separated list of paths
+#  - REF_LIST: path to a txt file with one path per line
+REF_WAV  = os.environ.get("REF_WAV", "").strip()
+REF_WAVS = os.environ.get("REF_WAVS", "/opt/apps/StyleTTS2/Data/VCTK/wav_norm/p225/p225_023.wav, /opt/apps/StyleTTS2/Data/VCTK/wav_norm/p226/p226_023.wav, /opt/apps/StyleTTS2/Data/VCTK/wav_norm/p248/p248_023.wav, /opt/apps/StyleTTS2/Data/VCTK/wav_norm/p251/p251_023.wav, /opt/apps/StyleTTS2/Data/VCTK/wav_norm/p376/p376_023.wav").strip()
+REF_LIST = os.environ.get("REF_LIST", "").strip()
+
 to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
 mean, std = -4, 4
@@ -52,6 +62,56 @@ def preprocess(wave):
     mel_tensor = to_mel(wave_tensor)
     mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
     return mel_tensor
+
+# ===== Helpers to gather reference paths and pretty names =====
+def _split_paths(s: str):
+    """Split on commas or whitespace; keep only non-empty strings."""
+    if not s:
+        return []
+    parts = []
+    for chunk in s.split(','):
+        parts.extend(chunk.strip().split())
+    return [p for p in map(str.strip, parts) if p]
+
+def _read_list_file(p: str):
+    if not p:
+        return []
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except Exception as e:
+        print(f"[ms] WARN: failed to read REF_LIST '{p}': {e}")
+        return []
+
+def gather_ref_paths():
+    paths = []
+    paths.extend(_split_paths(REF_WAVS))
+    paths.extend(_read_list_file(REF_LIST))
+    if REF_WAV:
+        paths.append(REF_WAV)
+    # de-dup while preserving order
+    seen = set(); out = []
+    for p in paths:
+        if p not in seen: seen.add(p); out.append(p)
+    return out
+
+# ===== Multi-speaker reference → features (Style ⊕ Predictor) =====
+@torch.no_grad()
+def compute_ref_features_from_wav(ref_wav_path: str, sr: int = 24000):
+    """
+    Build the context features expected by the multi-speaker diffusion UNet:
+      ref_feat = concat(style_encoder(ref_mel), predictor_encoder(ref_mel))  # [1, 256]
+    """
+    wave, in_sr = librosa.load(ref_wav_path, sr=sr)
+    # light trim; keep small leading context
+    audio, _ = librosa.effects.trim(wave, top_db=30)
+    if in_sr != sr:
+        audio = librosa.resample(audio, in_sr, sr)
+    mel = preprocess(audio).to(device)                 # [1, 80, T]
+    # encoders expect [B, 1, 80, T]
+    ref_ss = model.style_encoder(mel.unsqueeze(1))     # [1, 128]
+    ref_sp = model.predictor_encoder(mel.unsqueeze(1)) # [1, 128]
+    return torch.cat([ref_ss, ref_sp], dim=1)          # [1, 256]
 
 def compute_style(ref_dicts):
     reference_embeddings = {}
@@ -72,7 +132,7 @@ def compute_style(ref_dicts):
 import phonemizer
 global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True, with_stress=True, words_mismatch='ignore')
 
-config = yaml.safe_load(open("Models/LJSpeech/config.yml"))
+config = yaml.safe_load(open("Models/VCTK/config.yml"))
 
 # load pretrained ASR model
 ASR_config = config.get('ASR_config', False)
@@ -92,7 +152,14 @@ model = build_model(recursive_munch(config['model_params']), text_aligner, pitch
 _ = [model[key].eval() for key in model]
 _ = [model[key].to(device) for key in model]
 
-params_whole = torch.load("Models/LJSpeech/epoch_2nd_00100.pth", map_location='cpu')
+# Detect multispeaker from config
+MULTISPEAKER = bool(config.get('model_params', {}).get('multispeaker', False))
+if MULTISPEAKER:
+    print("[ms] Multispeaker mode: expecting at least one reference audio (REF_WAV / REF_WAVS / REF_LIST).")
+else:
+    print("[ms] Single-speaker mode (no reference features required).")
+
+params_whole = torch.load("Models/VCTK/epoch_2nd_00004.pth")
 params = params_whole['net']
 
 for key in model:
@@ -122,7 +189,7 @@ sampler = DiffusionSampler(
     clamp=False
 )
 
-def inference(text, noise, diffusion_steps=5, embedding_scale=1):
+def inference(text, noise, diffusion_steps=5, embedding_scale=1, ref_feat: torch.Tensor | None = None):
     text = text.strip()
     text = text.replace('"', '')
     ps = global_phonemizer.phonemize([text])
@@ -141,9 +208,18 @@ def inference(text, noise, diffusion_steps=5, embedding_scale=1):
         bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s_pred = sampler(noise,
-              embedding=bert_dur[0].unsqueeze(0), num_steps=diffusion_steps,
-              embedding_scale=embedding_scale).squeeze(0)
+        # If multi-speaker, pass context features from reference audio
+        if MULTISPEAKER and (ref_feat is not None):
+            s_pred = sampler(
+                noise,
+                embedding=bert_dur[0].unsqueeze(0),
+                features=ref_feat,
+                num_steps=diffusion_steps,
+                embedding_scale=embedding_scale
+            ).squeeze(0)
+        else:
+            s_pred = sampler(noise, embedding=bert_dur[0].unsqueeze(0),
+                             num_steps=diffusion_steps, embedding_scale=embedding_scale).squeeze(0)
 
         s = s_pred[:, 128:]
         ref = s_pred[:, :128]
@@ -171,7 +247,7 @@ def inference(text, noise, diffusion_steps=5, embedding_scale=1):
 
     return out.squeeze().cpu().numpy()
 
-def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_scale=1):
+def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_scale=1, ref_feat: torch.Tensor | None = None):
   text = text.strip()
   text = text.replace('"', '')
   ps = global_phonemizer.phonemize([text])
@@ -190,9 +266,18 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
       bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
       d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-      s_pred = sampler(noise,
-            embedding=bert_dur[0].unsqueeze(0), num_steps=diffusion_steps,
-            embedding_scale=embedding_scale).squeeze(0)
+      if MULTISPEAKER and (ref_feat is not None):
+          s_pred = sampler(
+              noise,
+              embedding=bert_dur[0].unsqueeze(0),
+              features=ref_feat,
+              num_steps=diffusion_steps,
+              embedding_scale=embedding_scale
+          ).squeeze(0)
+      else:
+          s_pred = sampler(noise,
+                           embedding=bert_dur[0].unsqueeze(0),
+                           num_steps=diffusion_steps, embedding_scale=embedding_scale).squeeze(0)
 
       if s_prev is not None:
           # convex combination of previous and current style
@@ -224,128 +309,46 @@ def LFinference(text, s_prev, noise, alpha=0.7, diffusion_steps=5, embedding_sca
 
 
 # synthesize a text
-text = "I wasn’t asking for magic. Just honesty. Just a moment that felt real. " \
-"But you... you gave me maybes, silences, and almosts. And I held on to all of them like they meant something. " \
-"Like you meant something. I loved you with everything I had — and you made it feel like too much." 
+text = "I was not asking for magic. Just honesty. Just a moment that felt real. "
 
 
-# # Steps 5 ; Embedding 1
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=1)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 1= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_1.wav", wav, 24000)
-
-# # Steps 200 ; Embedding 1
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=200, embedding_scale=1)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 200 Steps and Embedding 1= {time_taken:5f}")
-# sf.write("embedding/output_200_steps_embedding_1.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 3
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=3)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 3= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_3.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 5
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=5)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 5= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_5.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 2
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=2)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 2= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_2.wav", wav, 24000)
-
-# # Steps 200 ; Embedding 2
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 200 Steps and Embedding 2= {time_taken:5f}")
-# sf.write("embedding/output_200_steps_embedding_2.wav", wav, 24000)
-
-# # Steps 5 ; Embedding 25
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=25)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 25= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_25.wav", wav, 24000)
-
-
-# # Steps 5 ; Embedding 1.5
-# start = time.time()
-# noise = torch.randn(1,1,256).to(device)
-# wav = inference(text, noise, diffusion_steps=5, embedding_scale=1.5)
-# time_taken = (time.time() - start)
-# rtf = time_taken / (len(wav) / 24000)
-# print(f"RTF = {rtf:5f}")
-# print(f"Time Taken for 5 Steps and Embedding 1.5= {time_taken:5f}")
-# sf.write("embedding/output_5_steps_embedding_1_5.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2A= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2A.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2B= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2B.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2C= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2C.wav", wav, 24000)
-
-# Steps 200 ; Embedding 2
-start = time.time()
-noise = torch.randn(1,1,256).to(device)
-wav = inference(text, noise, diffusion_steps=200, embedding_scale=2)
-time_taken = (time.time() - start)
-rtf = time_taken / (len(wav) / 24000)
-print(f"RTF = {rtf:5f}")
-print(f"Time Taken for 200 Steps and Embedding 2D= {time_taken:5f}")
-sf.write("embedding/output_200_steps_embedding_2D.wav", wav, 24000)
+# === Run inference ===
+if not MULTISPEAKER:
+    # single-speaker path: do exactly one synthesis as before
+    start = time.time()
+    noise = torch.randn(1,1,256).to(device)
+    wav = inference(text, noise, diffusion_steps=20, embedding_scale=1, ref_feat=None)
+    time_taken = (time.time() - start)
+    rtf = time_taken / (len(wav) / 24000)
+    print(f"RTF = {rtf:5f}")
+    print(f"Time Taken (single-speaker, 20 steps, es=1): {time_taken:5f}")
+    sf.write(os.path.join(out_dir, "output_20steps_es1.wav"), wav, 24000)
+else:
+    ref_paths = gather_ref_paths()
+    if not ref_paths:
+        raise RuntimeError("[ms] Multispeaker: no references found. "
+                           "Set REF_WAV, or REF_WAVS (comma/space list), or REF_LIST (file with one path per line).")
+    print(f"[ms] Found {len(ref_paths)} reference file(s).")
+    for idx, ref_path in enumerate(ref_paths, 1):
+        if not os.path.exists(ref_path):
+            print(f"[ms] WARN: reference does not exist, skipping: {ref_path}")
+            continue
+        try:
+            ref_feat = compute_ref_features_from_wav(ref_path).to(device)  # [1, 256]
+        except Exception as e:
+            print(f"[ms] WARN: failed to build ref features for '{ref_path}': {e}")
+            continue
+        # nice stub for filename: <parent-name>_<stem> (e.g., p225_p225_003)
+        p = pathlib.Path(ref_path)
+        parent = p.parent.name or "spk"
+        stub = f"{parent}_{p.stem}"
+        # synth
+        start = time.time()
+        noise = torch.randn(1,1,256).to(device)
+        wav = inference(text, noise, diffusion_steps=20, embedding_scale=1, ref_feat=ref_feat)
+        time_taken = (time.time() - start)
+        rtf = time_taken / (len(wav) / 24000)
+        print(f"[ms] [{idx}/{len(ref_paths)}] {stub}: RTF={rtf:5f}  time={time_taken:5f}")
+        out_name = os.path.join(out_dir, f"{stub}_20steps_es1.wav")
+        sf.write(out_name, wav, 24000)
+    print("[ms] Done.")

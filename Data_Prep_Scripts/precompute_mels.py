@@ -17,6 +17,12 @@ Usage (zero-arg, uses config defaults):
 Usage (custom config or paths):
     python precompute_mels.py --config path/to/config.yml
     python precompute_mels.py --root /data/wavs --train Data/train.txt --val Data/val.txt --out /opt/data/mel_cache
+
+    python precompute_mels.py --root /opt/apps/StyleTTS2/Data/VCTK/wav_norm \
+    --train /opt/apps/StyleTTS2/Data/VCTK/train_list.txt --val /opt/apps/StyleTTS2/Data/VCTK/val_list.txt \
+    --out /opt/apps/StyleTTS2/Data/VCTK/mel_cache
+
+
 """
 import argparse
 import os
@@ -119,7 +125,7 @@ def process_split(root: str, rel_list: List[str], out_dir: str, to_mel, sr: int)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.environ.get("CFG", "Configs/config.yml"))
+    ap.add_argument("--config", default=os.environ.get("CFG", None))
     ap.add_argument("--root", default=None)
     ap.add_argument("--train", default=None)
     ap.add_argument("--val", default=None)
@@ -128,7 +134,28 @@ def main():
     args = ap.parse_args()
 
     # Load config (try a few fallbacks)
-    cfg = load_cfg([args.config, "Configs/config.yml", "config.yml"])
+
+    # Decide whether to load a config file.
+    # If the user supplied any CLI paths, skip defaults entirely.
+    user_overrides = any([args.root, args.train, args.val, args.out, args.sr])
+    cfg = {}
+
+    if args.config:  # user explicitly provided a config path or set $CFG
+        try:
+            cfg = load_cfg([args.config])      # load only that path
+        except FileNotFoundError as e:
+            if not user_overrides:
+                # no CLI overrides; try fallbacks to keep old behavior
+                cfg = load_cfg(["Configs/config.yml", "config.yml"])
+            else:
+                # CLI overrides present; proceed without a config
+                cfg = {}
+    elif not user_overrides:
+        # no config arg and no CLI overrides → try the classic fallbacks
+        cfg = load_cfg(["Configs/config.yml", "config.yml"])
+    # else: leave cfg = {}
+
+
     root_d, train_d, val_d, out_d, sr_d = infer_defaults_from_cfg(cfg)
 
     root = args.root or root_d

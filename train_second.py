@@ -284,6 +284,12 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
     logger.info(f"[data] train items={len(train_list)} val items={len(val_list)}")
 
+    tr_cnt, tr_bad = _summarize_speakers(train_list)
+    va_cnt, va_bad = _summarize_speakers(val_list)
+    log_print(f"[spk] train unique={len(tr_cnt)} bad_defaulted={tr_bad} top={tr_cnt.most_common(5)}", logger)
+    log_print(f"[spk]  val  unique={len(va_cnt)} bad_defaulted={va_bad} top={va_cnt.most_common(5)}", logger)
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache(); 
@@ -711,8 +717,8 @@ def main(config_path):
 
                     d_gt = s2s_attn_mono.sum(axis=-1).detach()
                     
-                    # compute reference styles
-                    if multispeaker and epoch >= diff_epoch:
+                    # compute reference styles (always, if multispeaker)
+                    if multispeaker:
                         ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
                         ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
                         ref = torch.cat([ref_ss, ref_sp], dim=1)
@@ -1105,13 +1111,18 @@ def main(config_path):
                     log_discLM = 0.0
                     log_genLM  = 0.0
                         
-                    slm_out = slmadv(i, 
-                                    y_rec_gt, 
-                                    y_rec_gt_pred, 
-                                    waves, 
-                                    mel_input_length,
-                                    ref_texts, 
-                                    ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+                    slm_out = slmadv(
+                        i,
+                        y_rec_gt,
+                        y_rec_gt_pred,
+                        waves,
+                        mel_input_length,
+                        ref_texts,
+                        ref_lengths,
+                        use_ind,
+                        s_trg.detach(),
+                        ref if multispeaker else None
+                    )
 
                     if slm_out is None:
                         # stay in the step so logging/heartbeat still prints
@@ -1298,6 +1309,7 @@ def main(config_path):
                     waves = batch[0]
                     batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    ref = None
                     with torch.no_grad():
                         mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                         
@@ -1530,14 +1542,14 @@ def main(config_path):
                 if multispeaker and epoch >= diff_epoch:
                     ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
                     ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref_s = torch.cat([ref_ss, ref_sp], dim=1)
+                    ref = torch.cat([ref_ss, ref_sp], dim=1)
                     
                 for bib in range(len(d_en)):
                     if multispeaker:
                         s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
                               embedding=bert_dur[bib].unsqueeze(0),
                               embedding_scale=1,
-                                features=ref_s[bib].unsqueeze(0), # reference from the same speaker as the embedding
+                                features=ref[bib].unsqueeze(0), # reference from the same speaker as the embedding
                                  num_steps=5).squeeze(1)
                     else:
                         s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
@@ -1694,6 +1706,19 @@ def _print_last_oom():
             print(lines[-1])
     except Exception:
         pass
+
+def _summarize_speakers(lines):
+    from collections import Counter
+    counts = Counter(); bad = 0
+    for ln in lines:
+        parts = str(ln).strip().split('|')
+        if len(parts) >= 3:
+            try:
+                sid = int(parts[2])
+            except Exception:
+                sid = 0; bad += 1
+            counts[sid] += 1
+    return counts, bad
 
 
 if __name__=="__main__":
