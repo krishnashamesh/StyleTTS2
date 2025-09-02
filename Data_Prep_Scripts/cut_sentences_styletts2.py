@@ -35,6 +35,139 @@ logging.basicConfig(level=logging.INFO)
 _PHONEMIZER_STATUS = "init"
 
 # -----------------------
+# Punctuation graft helpers
+# -----------------------
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
+_ELLIPSIS_RE = re.compile(r"\.\.\.|…")
+
+def _norm_token(t: str, keep_apostrophes: bool = True) -> str:
+    t = t.strip()
+    t = _ELLIPSIS_RE.sub("...", t)
+    if keep_apostrophes:
+        # keep inner apostrophes: gaffer’s -> gaffer’s, don't -> don't
+        t = re.sub(r"(^[^\w']+|[^\w']+$)", "", t)
+        t = re.sub(r"[^\w']+", " ", t)
+    else:
+        t = re.sub(r"[^\w]+", " ", t)
+    return re.sub(r"\s+", " ", t.lower()).strip()
+
+def _tokenize_src_text_with_punct(text: str):
+    """
+    Returns:
+      tokens: list of dicts:
+        - type: "word" | "punct"
+        - text: original token text (preserve case/punct)
+        - norm: normalized (for words only)
+      word_to_token_idx: list mapping src_word_index -> token_index
+      src_words_norm: list of normalized word tokens (sequence for alignment)
+    """
+    # split into words and punctuation tokens while preserving order
+    tokens = []
+    i = 0
+    while i < len(text):
+        m_ell = _ELLIPSIS_RE.match(text, i)
+        if m_ell:
+            tokens.append({"type":"punct","text":m_ell.group(0)})
+            i = m_ell.end()
+            continue
+        m_w = _WORD_RE.match(text, i)
+        if m_w:
+            w = m_w.group(0)
+            tokens.append({"type":"word","text":w,"norm":_norm_token(w)})
+            i = m_w.end()
+            continue
+        # single char punctuation/space
+        ch = text[i]
+        if not ch.isspace():
+            tokens.append({"type":"punct","text":ch})
+        i += 1
+    # build src word sequence + map to token indices
+    word_to_token_idx = []
+    src_words_norm = []
+    for ti, tok in enumerate(tokens):
+        if tok["type"] == "word":
+            word_to_token_idx.append(ti)
+            src_words_norm.append(tok["norm"])
+    return tokens, word_to_token_idx, src_words_norm
+
+def _load_punct_source_text(path: str | Path) -> Optional[str]:
+    p = Path(path)
+    if not p.exists():
+        logger.warning("punct_source not found: %s", path)
+        return None
+    try:
+        # support manifest.json (single JSON line) or transcript.jsonl (first line)
+        txt = p.read_text(encoding="utf-8").splitlines()
+        line = txt[0] if txt else ""
+        obj = json.loads(line)
+        return obj.get("text", "") or ""
+    except Exception as e:
+        logger.warning("Failed to read punct_source %s (%s)", path, e)
+        return None
+
+def _align_global(all_words_norm: List[str], src_words_norm: List[str]):
+    """Build a mapping from global aligned-words index -> src word index via SequenceMatcher."""
+    from difflib import SequenceMatcher
+    sm = SequenceMatcher(a=all_words_norm, b=src_words_norm, autojunk=False)
+    map_a_to_b = {}
+    for tag, a0, a1, b0, b1 in sm.get_opcodes():
+        if tag == "equal":
+            for i in range(a0, a1):
+                map_a_to_b[i] = b0 + (i - a0)
+        elif tag in ("replace",):
+            # if lengths match, try 1:1 salvage
+            if (a1 - a0) == (b1 - b0):
+                for i in range(a0, a1):
+                    map_a_to_b[i] = b0 + (i - a0)
+            # else: leave unmapped; will fallback later
+    return map_a_to_b
+
+def _words_indices_in_range(all_words: List[Dict[str,Any]], s: float, e: float, eps: float=0.005) -> List[int]:
+    out = []
+    for w in all_words:
+        ws = float(w.get("start",0.0)); we = float(w.get("end",0.0))
+        if (ws < (e - eps)) and (we > (s + eps)):
+            out.append(w["__idx"])
+    return out
+
+def _graft_text_for_window(
+    idxs: List[int],
+    all_words: List[Dict[str,Any]],
+    map_idx_to_src: Dict[int,int],
+    src_tokens: List[Dict[str,Any]],
+    src_word_to_tok: List[int],
+) -> Optional[str]:
+    """Reconstruct cased+punctuated text slice by spanning the src token range covering mapped words."""
+    src_idxs = [map_idx_to_src.get(i) for i in idxs if i in map_idx_to_src]
+    if not src_idxs:
+        return None
+    lo, hi = min(src_idxs), max(src_idxs)
+    # map src word indices to token indices
+    try:
+        t0 = src_word_to_tok[lo]
+        t1 = src_word_to_tok[hi]
+    except Exception:
+        return None
+    # include all tokens between (inclusive)
+    toks = src_tokens[t0 : t1 + 1]
+    # join with no extra spaces around punctuation; keep original case
+    out = []
+    for i, tk in enumerate(toks):
+        if tk["type"] == "punct":
+            # attach punctuation to previous if exists
+            if out:
+                out[-1] = out[-1] + tk["text"]
+            else:
+                out.append(tk["text"])
+        else:
+            # word
+            if out:
+                out.append(" " + tk["text"])
+            else:
+                out.append(tk["text"])
+    return "".join(out).strip()
+ 
+# -----------------------
 # JSON loaders (robust)
 # -----------------------
 
@@ -167,10 +300,12 @@ def smart_sentence_chunks_from_words(
     hard_punct: str = "?!",
     max_chars: Optional[int] = None,
     min_dur_singleton: float = 0.30,
+    split_on_speaker_change: bool = True,
 ) -> List[Tuple[float,float,str]]:
     if not words: return []
     chunks: List[Tuple[float,float,str]] = []
     buf: List[Dict[str,Any]] = [words[0]]
+    cur_spk = words[0].get("spk", None)
 
     def buf_text() -> str: return " ".join(w.get("word","") for w in buf).strip()
     def buf_dur()  -> float: return (buf[-1]["end"] - buf[0]["start"]) if buf else 0.0
@@ -199,6 +334,9 @@ def smart_sentence_chunks_from_words(
         }
 
         boundary = False
+        # hard break on speaker change
+        if split_on_speaker_change and (cur.get("spk") != cur_spk):
+            boundary = True
         if gap >= gap_soft: boundary = True
         elif is_hard:       boundary = True
         elif is_ellipsis_tok and gap >= gap_ellipsis: boundary = True
@@ -211,6 +349,7 @@ def smart_sentence_chunks_from_words(
                 buf.append(cur)
                 chunks.append((buf[0]["start"], buf[-1]["end"], buf_text()))
                 buf = []
+                cur_spk = cur.get("spk")
                 continue
             if buf and buf_dur() < 1.0 and not all_fillers():
                 # keep accumulating until we reach 1s or punctuation
@@ -218,6 +357,7 @@ def smart_sentence_chunks_from_words(
             else:
                 chunks.append((buf[0]["start"], buf[-1]["end"], buf_text()))
                 buf = [cur]
+                cur_spk = cur.get("spk")
                 continue
         buf.append(cur)
 
@@ -245,6 +385,17 @@ def words_text_in_range(all_words: List[Dict[str,Any]], start_s: float, end_s: f
         if (ws < (end_s - eps)) and (we > (start_s + eps)):
             toks.append(w.get("word",""))
     return " ".join(toks).strip()
+
+
+# -----------------------
+# (optional) restore mode stub
+# -----------------------
+def _restore_punct_and_case(text: str) -> str:
+    """
+    Placeholder: hook up NeMo Punctuation+Capitalization here if desired.
+    For now, return text unchanged (we rely on 'graft' to supply real punctuation).
+    """
+    return text
 
 # -----------------------
 # IPA (optional)
@@ -278,6 +429,9 @@ def cut_sentences(
     manifest_path: str | Path,
     spk2id_path: str | Path,
     *,
+    punct_mode: str = "graft",
+    punct_source: Optional[str] = None,
+    manifest_field: str = "ipa",
     vad_npy: Optional[str]=None,
     vad_hop: Optional[float]=None,
     min_dur: float=1.0,
@@ -298,7 +452,15 @@ def cut_sentences(
 ):
     audio24k_path = Path(audio24k_path)
     segs = load_aligned_words(aligned_json)
-    all_words = [w for s in segs for w in s["words"]]
+
+    all_words = []
+    for s in segs:
+        for w in s["words"]:
+            w = dict(w)
+            w["__idx"] = len(all_words)
+            w["__norm"] = _norm_token(w.get("word",""))
+            all_words.append(w)
+
     spk_intvs = parse_rttm(rttm_path)
 
     sr24 = 24000
@@ -311,7 +473,21 @@ def cut_sentences(
     total_frames = len(sf_in)
     audio_dur = total_frames / float(sr24)
 
-    # 1) Build window candidates from words (per segment), then global merging if requested
+
+    # 1) Annotate words with per-word speaker (max overlap with RTTM)
+    def _assign_spk(w):
+        ws, we = w["start"], w["end"]
+        best, best_cov = None, 0.0
+        for spk, ivs in spk_intvs.items():
+            cov = union_coverage_len((ws,we), ivs)
+            if cov > best_cov:
+                best, best_cov = spk, cov
+        w["spk"] = best
+        return w
+
+    all_words = list(map(_assign_spk, all_words))
+
+    # 2) Build window candidates from words (per segment), speaker-aware
     pending = []
     for s in segs:
         words = s["words"]
@@ -323,6 +499,7 @@ def cut_sentences(
                 gap_ellipsis=ellipsis_gap,
                 max_chars=max_chars,
                 min_dur_singleton=min_dur_singleton,
+                split_on_speaker_change=True,
             )
         )
     pending.sort(key=lambda x: x[0])
@@ -367,6 +544,30 @@ def cut_sentences(
         logger.warning("No sentence windows built from aligned words. Check thresholds / input.")
     logger.info("Candidate windows: %d", len(windows))
 
+ 
+    # Build punctuation graft context if requested
+    graft_ready = False
+    map_idx_to_src = {}
+    src_tokens = []; src_word_to_tok = []; src_words_norm = []
+    if punct_mode == "graft":
+        if not punct_source:
+            logger.warning("--punct_mode graft requires --punct_source; falling back to 'none'")
+            punct_mode = "none"
+        else:
+            src_text = _load_punct_source_text(punct_source)
+            if not src_text:
+                logger.warning("punct_source provided but empty/invalid; falling back to 'none'")
+                punct_mode = "none"
+            else:
+                src_tokens, src_word_to_tok, src_words_norm = _tokenize_src_text_with_punct(src_text)
+                all_norm = [w["__norm"] for w in all_words]
+                map_idx_to_src = _align_global(all_norm, src_words_norm)
+                graft_ready = True if map_idx_to_src else False
+                if not graft_ready:
+                    logger.warning("Could not build alignment to punctuation source; falling back to 'none'")
+                    punct_mode = "none"
+
+
     # Optional VAD posterior
     vad: Optional[np.ndarray] = None
     hop: Optional[float] = None
@@ -394,21 +595,74 @@ def cut_sentences(
         if ei<=si: return 0.0
         return float(np.mean(vad[si:ei]))
 
-    # 2) Filter, slice audio, write files + manifest + QC
+    # Speaker purity threshold (final guard)
+    purity_min = 0.90
+    try:
+        # read from CLI if provided (see arg parser changes below)
+        purity_min = float(os.environ.get("CUT_SPEAKER_PURITY_MIN", "0.90"))
+    except Exception:
+        pass
+
+    # 3) Filter, slice audio, write files + manifest + QC
     spk2id: Dict[str,int] = {}
     seg_idx = 0
     qc_rows = []
     with open(manifest_path, "w", encoding="utf-8") as man_f:
         for i,(s,e,txt_pre) in enumerate(windows):
-            txt = words_text_in_range(all_words, s, e) or txt_pre
+
+            # base normalized text from timed words
+            txt_norm = " ".join(
+                w["word"] for w in all_words
+                if (w["start"] < (e - 0.005)) and (w["end"] > (s + 0.005))
+            ).strip() or txt_pre
+            # choose display text according to punct_mode
+            display_text = txt_norm
+            if punct_mode == "graft" and graft_ready:
+                idxs = _words_indices_in_range(all_words, s, e)
+                graft = _graft_text_for_window(idxs, all_words, map_idx_to_src, src_tokens, src_word_to_tok)
+                if graft and len(graft) >= max(1, int(0.6*len(txt_norm))):
+                    display_text = graft
+                else:
+                    # soft fallback: capitalize first token if sentence-like
+                    display_text = txt_norm[:1].upper() + txt_norm[1:] if txt_norm else txt_norm
+            elif punct_mode == "restore":
+                display_text = _restore_punct_and_case(txt_norm)
+            else:
+                # 'none' or unknown: keep normalized but capitalize sentence-initial word heuristically
+                display_text = txt_norm[:1].upper() + txt_norm[1:] if txt_norm else txt_norm
+
+
             dur = e - s
             if dur < min_dur:
                 continue
 
-            dom_spk, has_ovl, _ = dominant_speaker_and_overlap((s,e), spk_intvs, cover_thres=0.05)
+            dom_spk, has_ovl, cover = dominant_speaker_and_overlap((s,e), spk_intvs, cover_thres=0.05)
             if has_ovl and overlap_policy == "drop":
                 continue
             if dom_spk is None:
+                continue
+
+            # enforce purity
+            dur_win = max(1e-9, e - s)
+            purity = cover.get(dom_spk, 0.0) / dur_win
+            if purity < purity_min:
+                # try a surgical split at nearest internal word edge where speaker flips
+                idxs = [k for k,w in enumerate(all_words) if (w["start"] < (e-0.005)) and (w["end"] > (s+0.005))]
+                cut_pts = []
+                for a,b in zip(idxs, idxs[1:]):
+                    if all_words[a].get("spk") != all_words[b].get("spk"):
+                        cut_pts.append( (all_words[a]["end"] + all_words[b]["start"]) * 0.5 )
+                did_split = False
+                for cp in cut_pts:
+                    if (cp - s) > 0.35 and (e - cp) > 0.35:
+                        # split into two sub-windows by revisiting the queue (simple approach: skip/continue)
+                        pending.append((s, cp, txt_pre))
+                        pending.append((cp, e, txt_pre))
+                        did_split = True
+                        break
+                if did_split:
+                    continue
+                # else drop mixed window
                 continue
 
             mean_vad = mean_vad_in_window((s,e))
@@ -456,8 +710,11 @@ def cut_sentences(
             wav_path = out_dir / wav_name
             sf.write(str(wav_path), audio, sr24, subtype="PCM_16")
 
-            ipa_or_text = phonemize_ipa(txt, lang_for_ipa) if txt else ""
-            man_f.write(f"{wav_name} | {ipa_or_text} | {spk2id[dom_spk]}\n")
+            if manifest_field == "ipa":
+                field_val = phonemize_ipa(display_text, lang_for_ipa) if display_text else ""
+            else:
+                field_val = display_text
+            man_f.write(f"{wav_name} | {field_val} | {spk2id[dom_spk]}\n")
 
             # QC uses padded/capped times for transparency
             s_pad = round(start_frame/sr24, 3)
@@ -471,7 +728,7 @@ def cut_sentences(
                 "dur": round(e_pad-s_pad, 3),
                 "mean_vad": round(mean_vad,3),
                 "overlap": int(has_ovl),
-                "text": txt,
+                "text": display_text,
             })
             seg_idx += 1
 
@@ -507,6 +764,13 @@ def build_argparser():
     p.add_argument("--vad_npy", default=None)
     p.add_argument("--vad_hop", type=float, default=None)
 
+    p.add_argument("--punct_mode", choices=["graft","time","restore","none"], default="graft",
+                   help="How to obtain punctuated+capitalized text for manifest.")
+    p.add_argument("--punct_source", default=None,
+                   help="Parakeet text source (manifest.json or transcript.jsonl) for 'graft'/'time' modes.")
+    p.add_argument("--manifest_field", choices=["ipa","text"], default="ipa",
+                   help="Which field to write into train_list.txt: IPA (phonemized) or text.")
+
     p.add_argument("--min_dur", type=float, default=1.0)
     p.add_argument("--gap_thres", type=float, default=1.2)
     p.add_argument("--period_gap", type=float, default=0.8)
@@ -524,6 +788,11 @@ def build_argparser():
     p.add_argument("--extend_tail_ms", type=int, default=0)
     p.add_argument("--join_guard_ms", type=int, default=120)
 
+    p.add_argument("--split_on_speaker_change", action="store_true", default=True,
+                   help="Break sentences when speaker label changes (recommended).")
+    p.add_argument("--speaker_purity_min", type=float, default=0.90,
+                   help="Min fraction of a single speaker's coverage required inside a cut.")
+
     p.add_argument("--qc_csv", default=None)
     return p
 
@@ -536,6 +805,9 @@ def main():
         out_wavs_dir=args.out_wavs_dir,
         manifest_path=args.manifest_path,
         spk2id_path=args.spk2id_path,
+        punct_mode=args.punct_mode,
+        punct_source=args.punct_source,
+        manifest_field=args.manifest_field,
         vad_npy=args.vad_npy,
         vad_hop=args.vad_hop,
         min_dur=args.min_dur,
