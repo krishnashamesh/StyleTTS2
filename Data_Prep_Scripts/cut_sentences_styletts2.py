@@ -185,6 +185,8 @@ def smart_sentence_chunks_from_words(
         chunks.append((buf[0]["start"], buf[-1]["end"], txt))
         buf = []
 
+    CAPITAL_BREAK_MIN_GAP = 0.06  # seconds
+
     for i in range(1, len(words)):
         prev, cur = words[i-1], words[i]
         gap = (cur.get("start", last_end) - prev.get("end", cur_start))
@@ -193,6 +195,21 @@ def smart_sentence_chunks_from_words(
         is_ellipsis_tok = (last_token in {"...", "…"} or last_token.endswith("..."))
         is_period  = (last_char == ".") and not is_ellipsis_tok
         is_hard    = last_char in hard_punct
+
+        # Also inspect punctuation on the *current* token
+        cur_token = cur.get("word","").strip()
+        cur_last  = cur_token[-1:] if cur_token else ""
+        cur_is_hard = cur_last in hard_punct  # e.g., "at?"
+        # Heuristic: next token looks like a sentence starter
+        cur_first = cur_token[:1]
+        cur_lc    = cur_token.lower()
+        cur_is_capital = bool(cur_first and cur_first.isupper())
+        cur_is_starter = cur_is_capital or cur_lc in {
+            "who","what","why","when","where","how",
+            "did","do","does","are","is","was","were",
+            "can","could","will","would","should","shall","have","has","had","oh","well"
+        }
+        # (we intentionally do NOT treat cur "."/ellipsis as hard here to keep your softer '.'/… rules)
 
         boundary = False
         if gap >= gap_soft:
@@ -204,7 +221,22 @@ def smart_sentence_chunks_from_words(
         elif is_period and gap >= gap_period:
             boundary = True
 
+        # Soft ellipsis/period but likely new sentence (capital/question start) → force boundary
+        if not boundary and gap >= CAPITAL_BREAK_MIN_GAP and (is_ellipsis_tok or is_period) and cur_is_starter:
+            boundary = True
+
         if boundary:
+            # If the *current* token carries a hard end mark (e.g., "at?"),
+            # attach it to the current sentence and flush *after* it.
+            if cur_is_hard and buf:
+                buf.append(cur)
+                last_end = cur.get("end", last_end)
+                flush(force=True)
+                buf = []
+                # start fresh from next iteration
+                # (do not seed buf with cur here; we just flushed it)
+                continue
+            # Otherwise, split before 'cur' (previous behaviour)
             if buf and buf_dur() < 1.0 and not buf_all_fillers():
                 # too short to flush; keep accumulating
                 pass
@@ -243,21 +275,38 @@ def smart_sentence_chunks_from_words(
 
 
 def _strong_end(txt: str) -> bool:
-    return len(txt) > 0 and txt.rstrip().endswith(('.', '!', '?'))
+    """Hard end for global stitching: treat ? and ! as hard; '.' only if not an ellipsis."""
+    if not txt:
+        return False
+    t = txt.rstrip()
+    if t.endswith('!') or t.endswith('?'):
+        return True
+    # consider '...' or '…' as NOT a strong end (soft)
+    if t.endswith('...') or t.endswith('…'):
+        return False
+    return t.endswith('.')
 
 def _words_text_in_range(all_words, start_s, end_s):
-    """Rebuild text from words whose midpoint lies inside [start_s, end_s]."""
-    mid = lambda w: 0.5 * (w.get("start", 0.0) + w.get("end", 0.0))
-    toks = [w.get("word","") for w in all_words if start_s <= mid(w) <= end_s]
-    txt = " ".join(toks).strip()
-    return txt
+    """Rebuild text from words that OVERLAP the window, with a 5 ms tolerance."""
+    eps = 0.005
+    toks = []
+    for w in all_words:
+        ws = float(w.get("start", 0.0))
+        we = float(w.get("end", 0.0))
+        if (ws < (end_s - eps)) and (we > (start_s + eps)):
+            toks.append(w.get("word", ""))
+    return " ".join(toks).strip()
 
-def _stitch_extend_global(windows, stitch_gap_ms, extend_tail_ms, audio_duration_seconds):
+def _stitch_extend_global(windows, stitch_gap_ms, extend_tail_ms, audio_duration_seconds,
+                                                pad_ms: int, join_guard_ms: int):
     """windows: list of (s,e,txt) across the whole file, time-sorted."""
     if not windows:
         return windows
     max_gap_s = stitch_gap_ms / 1000.0
     extend_s  = extend_tail_ms / 1000.0
+    pad_s     = pad_ms / 1000.0
+    guard_s   = max(0.0, join_guard_ms / 1000.0)
+
     # 1) stitch tiny gaps if no strong punctuation
     stitched = []
     for s, e, t in windows:
@@ -273,9 +322,20 @@ def _stitch_extend_global(windows, stitch_gap_ms, extend_tail_ms, audio_duration
     for i, (s, e, t) in enumerate(stitched):
         next_start = stitched[i+1][0] if i+1 < len(stitched) else None
         if next_start is None:
+            # last segment: allow extend but never beyond file end
             e2 = min(e + extend_s, audio_duration_seconds)
         else:
-            e2 = min(e + extend_s, max(s, next_start - 0.010))
+            # Cap so that AFTER padding there is still a guard, i.e.:
+            # (e2 + pad_s) <= (next_start - pad_s - guard_s)
+            # -> e2 <= next_start - (2*pad_s + guard_s)
+            cap_no_overlap = next_start - (pad_s + guard_s)
+            # never shrink below original e; only extend
+            hard_cap = max(e, min(cap_no_overlap, next_start))
+            e2_req = e + extend_s
+            e2 = min(e2_req, hard_cap)
+            if e2 < e2_req - 1e-6:
+                logger.info("Tail extend clamped: req=%.3f cap=%.3f (pad=%.3f guard=%.3f next=%.3f)",
+                             e2_req, e2, pad_s, guard_s, next_start)
         out.append((s, e2, t))
     return out
 
@@ -331,6 +391,7 @@ def cut_sentences(
     qc_csv: Optional[str]=None,
     stitch_gap_ms: int = 180,
     extend_tail_ms: int = 120,
+    join_guard_ms: int = 10,
 ):
     """
     Cuts PCM16 WAVs from 24k master by sentence windows and writes StyleTTS2 manifest.
@@ -354,7 +415,16 @@ def cut_sentences(
     audio_duration_seconds = total_frames / float(sr24)
 
     def _strong_end(txt: str) -> bool:
-        return len(txt) > 0 and txt.rstrip().endswith(('.', '!', '?'))
+        """Hard end for global stitching: treat ? and ! as hard; '.' only if not an ellipsis."""
+        if not txt:
+            return False
+        t = txt.rstrip()
+        if t.endswith('!') or t.endswith('?'):
+            return True
+        # consider '...' or '…' as NOT a strong end (soft)
+        if t.endswith('...') or t.endswith('…'):
+            return False
+        return t.endswith('.')
 
     def _apply_stitch_and_extend(windows: List[Tuple[float,float,str]]) -> List[Tuple[float,float,str]]:
         """Merge tiny gaps (no strong end punct), then extend tail safely."""
@@ -403,10 +473,18 @@ def cut_sentences(
     # Sort by time and apply global stitch/extend
     pending.sort(key=lambda t: t[0])
     audio_duration_seconds = len(sf_in) / float(sr24)
-    windows = _stitch_extend_global(pending, stitch_gap_ms, extend_tail_ms, audio_duration_seconds)
+
+    windows = _stitch_extend_global(
+        pending,
+        stitch_gap_ms=stitch_gap_ms,
+        extend_tail_ms=extend_tail_ms,
+        audio_duration_seconds=audio_duration_seconds,
+        pad_ms=pad_ms,
+        join_guard_ms=join_guard_ms,
+    )
 
     seg_idx = 0
-    for (s, e, _txt_premerge) in windows:
+    for idx, (s, e, _txt_premerge) in enumerate(windows):
         # rebuild text from ALL words (post-merge), not just the segment-local buffer
         sent_text = _words_text_in_range(all_words, s, e) or _txt_premerge
         dur = e - s
@@ -439,8 +517,22 @@ def cut_sentences(
         # Read slice and write WAV (with short fades to avoid clicks)
 
         pad = int(round((pad_ms/1000.0) * sr24)) if pad_ms > 0 else 0
+        guard_frames = int(round((join_guard_ms/1000.0) * sr24)) if join_guard_ms else 0
         start_frame = max(0, int(round(s * sr24)) - pad)
-        end_frame   = min(total_frames, int(round(e * sr24)) + pad)
+        next_start = windows[idx+1][0] if idx+1 < len(windows) else None
+        tail_plain = int(round(e * sr24))
+        tail_with_pad = tail_plain + pad
+        if next_start is not None:
+            next_start_frames = int(round(next_start * sr24))
+            if next_start_frames > tail_plain:
+                # no overlap: keep a tiny guard before next
+                end_cap = max(0, next_start_frames - guard_frames)
+                end_frame = min(total_frames, min(tail_with_pad, end_cap))
+            else:
+                # overlap case: do NOT pad into next
+                end_frame = min(total_frames, tail_plain)
+        else:
+            end_frame = min(total_frames, tail_with_pad)
 
         nframes = max(0, end_frame - start_frame)
         if nframes <= 0: 
@@ -536,6 +628,8 @@ def build_argparser():
                    help="If gap between consecutive segments < this, merge them (no strong end punctuation).")
     p.add_argument("--extend_tail_ms", type=int, default=120,
                    help="Extend each segment tail by this much unless it overruns the next segment.")
+    p.add_argument("--join_guard_ms", type=int, default=10,
+                   help="Extra guard between padded slices to ensure no overlap.")
     p.add_argument("--qc_csv", default=None)
     return p
 
@@ -564,6 +658,7 @@ def main():
         qc_csv=args.qc_csv,
         stitch_gap_ms=args.stitch_gap_ms,
         extend_tail_ms=args.extend_tail_ms,
+        join_guard_ms=args.join_guard_ms,
     )
 
 if __name__ == "__main__":
