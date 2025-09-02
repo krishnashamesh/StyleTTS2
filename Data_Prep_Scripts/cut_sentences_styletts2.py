@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 Cut sentence-level 24 kHz WAVs for StyleTTS2 from:
-  - WhisperX aligned words (segments_aligned.json)
-  - NeMo diarization (RTTM)
-  - 24 kHz mirror of trimmed proxy (Mode B)
+  - An aligned word-level JSON (generic): either top-level "utterances" or "segments",
+    each item containing a "words" list of {word, start, end}
+  - NeMo diarization RTTM (speaker turns)
 
-Policies (default):
-  - Min duration >= 1.0 s
-  - Sentence boundary: punctuation [.?!] OR inter-word gap >= 1.0 s
-  - Mean VAD >= 0.80 (if vad.npy provided). Otherwise, use speech-coverage proxy >= 0.80
-  - Overlap policy: "drop" (drop multi-speaker overlaps)
+This script is WhisperX-independent. It only needs word-level timings + RTTM.
+
+Policies (configurable via CLI):
+  - Min duration >= 1.0 s (non-filler) or >= min_dur_singleton if fillers-only
+  - Sentence boundary: punctuation [.?!] rules + acoustic pauses with tunable gap thresholds
+  - Mean speech coverage >= mean_vad_thres (uses RTTM coverage as proxy if no VAD posterior)
+  - Overlap policy: "drop" (discard overlapping multi-speaker) or "dominant" (keep dominant)
+  - Optional stitching of tiny gaps and safe tail extension with guard before next cut
 
 Outputs:
   - cuts_dir/*.wav (PCM16 @ 24k)
@@ -19,42 +22,79 @@ Outputs:
 """
 
 from __future__ import annotations
-import argparse
-import csv
-import json
-import math
-import os
+import argparse, csv, json, math, os, re, logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
-import re
 
-import logging
-
-# module logger (user can control level externally; defaults to WARNING)
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("cutter")
 logging.basicConfig(level=logging.INFO)
 
-# one-time status latch for phonemizer logging
 _PHONEMIZER_STATUS = "init"
 
 # -----------------------
-# Helpers
+# JSON loaders (robust)
 # -----------------------
 
-def load_segments_aligned(path: str | Path) -> List[Dict[str, Any]]:
-    data = json.load(open(path, "r", encoding="utf-8"))
-    # expected: {"segments":[{"start","end","text","words":[{"word","start","end"},...]},...]}
-    return data.get("segments", [])
+def _coerce_to_segments(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Accepts JSON with either:
+      - 'utterances': [{start,end,text?,words:[{word,start,end},...]}...]
+      - 'segments'  : [{start,end,text?,words:[{word,start,end},...]}...]
+    Returns a list of segment dicts with at least 'words' present.
+    """
+    if isinstance(data, dict):
+        if "utterances" in data and isinstance(data["utterances"], list):
+            base = data["utterances"]
+        elif "segments" in data and isinstance(data["segments"], list):
+            base = data["segments"]
+        else:
+            raise ValueError("Aligned JSON must contain a list at key 'utterances' or 'segments'.")
+    elif isinstance(data, list):
+        base = data
+    else:
+        raise ValueError("Aligned JSON must be a dict or list.")
+
+    out = []
+    for item in base:
+        words = item.get("words", [])
+        # tolerate common alt fields
+        if not words and "tokens" in item and isinstance(item["tokens"], list):
+            words = [{"word": t.get("text",""), "start": t.get("start"), "end": t.get("end")} for t in item["tokens"]]
+        # drop words missing timings
+        w_clean = []
+        for w in words:
+            try:
+                ws = float(w["start"]); we = float(w["end"])
+                if we > ws:
+                    w_clean.append({"word": str(w.get("word","")).strip(), "start": ws, "end": we})
+            except Exception:
+                continue
+        if not w_clean:
+            continue
+        s = min(w["start"] for w in w_clean)
+        e = max(w["end"]   for w in w_clean)
+        out.append({"start": float(item.get("start", s)), "end": float(item.get("end", e)),
+                    "text": item.get("text","").strip(), "words": w_clean})
+    return out
+
+def load_aligned_words(path: str | Path) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    segs = _coerce_to_segments(data)
+    n_words = sum(len(s["words"]) for s in segs)
+    logger.info("Aligned JSON loaded: %d segments, %d words total.", len(segs), n_words)
+    if n_words == 0:
+        raise RuntimeError("No words found in aligned JSON. Check the schema/keys.")
+    return segs
+
+# -----------------------
+# RTTM & timing helpers
+# -----------------------
 
 def parse_rttm(path: str | Path) -> Dict[str, List[Tuple[float, float]]]:
-    """
-    Returns {speaker_name: [(start, end), ...]} from RTTM.
-    Lines like: SPEAKER <file> <..> <start> <dur> <..> <spk_id>
-    """
     spk_intvs: Dict[str, List[Tuple[float, float]]] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -65,9 +105,9 @@ def parse_rttm(path: str | Path) -> Dict[str, List[Tuple[float, float]]]:
             start = float(parts[3]); dur = float(parts[4]); end = start + dur
             spk = parts[7]
             spk_intvs.setdefault(spk, []).append((start, end))
-    # sort & merge within each speaker for fast coverage calc
     for spk, ivs in spk_intvs.items():
         spk_intvs[spk] = merge_intervals(sorted(ivs))
+    logger.info("RTTM loaded: %d speakers.", len(spk_intvs))
     return spk_intvs
 
 def merge_intervals(iv: List[Tuple[float,float]], tol: float=1e-6) -> List[Tuple[float,float]]:
@@ -85,15 +125,10 @@ def merge_intervals(iv: List[Tuple[float,float]], tol: float=1e-6) -> List[Tuple
 def interval_length(iv: List[Tuple[float,float]]) -> float:
     return sum(e-s for s,e in iv)
 
-def intersect_len(a: Tuple[float,float], b: Tuple[float,float]) -> float:
-    s=max(a[0], b[0]); e=min(a[1], b[1])
-    return max(0.0, e-s)
-
 def union_coverage_len(target: Tuple[float,float], ivs: List[Tuple[float,float]]) -> float:
-    """Coverage of 'target' that is overlapped by 'ivs' (as union)."""
     if not ivs: return 0.0
-    # clip each to target window, merge, sum
-    clipped = [(max(target[0],s), min(target[1],e)) for s,e in ivs if e>target[0] and s<target[1]]
+    s0,e0 = target
+    clipped = [(max(s0,s), min(e0,e)) for s,e in ivs if e>s0 and s<e0]
     return interval_length(merge_intervals(sorted(clipped)))
 
 def dominant_speaker_and_overlap(
@@ -101,168 +136,97 @@ def dominant_speaker_and_overlap(
     spk_intvs: Dict[str, List[Tuple[float,float]]],
     cover_thres: float = 0.05
 ) -> Tuple[Optional[str], bool, Dict[str,float]]:
-    """
-    Return (dominant_spk, has_overlap, cover_map).
-    dominant_spk chosen by max coverage within 'win'.
-    has_overlap = True if 2+ speakers each cover >= cover_thres of 'win'.
-    """
     dur = max(1e-9, win[1]-win[0])
-    cover_map={}
+    cover={}
     for spk, ivs in spk_intvs.items():
         cov = union_coverage_len(win, ivs)
-        if cov > 0: cover_map[spk]=cov
-    if not cover_map:
-        return None, False, {}
-    # check overlap
-    big = [spk for spk,cov in cover_map.items() if cov/dur >= cover_thres]
+        if cov>0: cover[spk]=cov
+    if not cover: return None, False, {}
+    big = [spk for spk,c in cover.items() if c/dur >= cover_thres]
     has_overlap = len(big) >= 2
-    # dominant
-    dom = max(cover_map.items(), key=lambda kv: kv[1])[0]
-    return dom, has_overlap, cover_map
+    dom = max(cover.items(), key=lambda kv: kv[1])[0]
+    return dom, has_overlap, cover
 
-def load_vad_probs(path_npy: Optional[str], hop_s: Optional[float]) -> Tuple[Optional[np.ndarray], Optional[float]]:
-    if not path_npy: return None, None
-    arr = np.load(path_npy)  # shape [T] or [T, 2]? assume speech prob vector
-    if arr.ndim==2 and arr.shape[1] >= 1:
-        arr = arr[:, 1] if arr.shape[1] > 1 else arr[:, 0]
-    return arr.astype(np.float32), hop_s
-
-def mean_vad_in_window(vad: Optional[np.ndarray], hop: Optional[float], win: Tuple[float,float]) -> Optional[float]:
-    if vad is None or hop is None: return None
-    s_idx = max(0, int(math.floor(win[0] / hop)))
-    e_idx = min(len(vad), int(math.ceil(win[1] / hop)))
-    if e_idx <= s_idx: return 0.0
-    return float(np.mean(vad[s_idx:e_idx]))
+# -----------------------
+# Segmentation from words
+# -----------------------
 
 FILLER_RE = re.compile(
     r"^(uh|um|erm|hmm+|mm+|mhm+|uh\-huh|uhh+|ah+|oh+|eh+|huh+|hmmm+)$",
     re.IGNORECASE,
 )
-
 def _is_filler(tok: str) -> bool:
     t = tok.strip().strip(".,!?;:…'\"-—").lower()
     return bool(FILLER_RE.match(t))
 
 def smart_sentence_chunks_from_words(
     words: List[Dict[str,Any]],
-    gap_soft: float = 1.0,        # break if inter-word gap >= this
-    gap_period: float = 0.8,      # require at least this gap after '.' to break
-    gap_ellipsis: float = 1.2,    # require larger gap after '...'/'…' to break
-    hard_punct: str = "?!",       # always break on these
+    gap_soft: float = 1.0,
+    gap_period: float = 0.8,
+    gap_ellipsis: float = 1.2,
+    hard_punct: str = "?!",
     max_chars: Optional[int] = None,
-    min_dur_singleton: float = 0.30,  # keep tiny filler-only chunks down to this
+    min_dur_singleton: float = 0.30,
 ) -> List[Tuple[float,float,str]]:
-    """
-    Smarter segmentation:
-      - Hard breaks on '?/!' regardless of gap.
-      - '.' is a soft break: only split if gap >= gap_period.
-      - '...' or '…' is even softer: split only if gap >= gap_ellipsis.
-      - Always split on a big acoustic pause: gap >= gap_soft.
-      - Preserve filler-only singletons down to min_dur_singleton.
-    """
-    if not words:
-        return []
-
+    if not words: return []
     chunks: List[Tuple[float,float,str]] = []
     buf: List[Dict[str,Any]] = [words[0]]
-    cur_start = words[0].get("start", 0.0)
-    last_end  = words[0].get("end", cur_start)
 
-    def buf_text() -> str:
-        return " ".join(w.get("word","") for w in buf).strip()
-    def buf_dur() -> float:
-        return (buf[-1].get("end", last_end) - buf[0].get("start", cur_start)) if buf else 0.0
-    def buf_all_fillers() -> bool:
-        return bool(buf) and all(_is_filler(w.get("word","")) for w in buf)
-    def flush(force=False):
-        nonlocal buf, cur_start, last_end
-        if not buf:
-            return
-        d = buf_dur()
-        txt = buf_text()
-        if not force and d < 1.0 and not buf_all_fillers():
-            return
-        chunks.append((buf[0]["start"], buf[-1]["end"], txt))
-        buf = []
+    def buf_text() -> str: return " ".join(w.get("word","") for w in buf).strip()
+    def buf_dur()  -> float: return (buf[-1]["end"] - buf[0]["start"]) if buf else 0.0
+    def all_fillers()-> bool: return bool(buf) and all(_is_filler(w.get("word","")) for w in buf)
 
-    CAPITAL_BREAK_MIN_GAP = 0.06  # seconds
+    CAPITAL_BREAK_MIN_GAP = 0.06  # s
 
     for i in range(1, len(words)):
         prev, cur = words[i-1], words[i]
-        gap = (cur.get("start", last_end) - prev.get("end", cur_start))
-        last_token = prev.get("word","").strip()
-        last_char  = last_token[-1:] if last_token else ""
-        is_ellipsis_tok = (last_token in {"...", "…"} or last_token.endswith("..."))
+        gap = cur["start"] - prev["end"]
+        last_tok = prev.get("word","").strip()
+        last_char= last_tok[-1:] if last_tok else ""
+        is_ellipsis_tok = (last_tok in {"...", "…"} or last_tok.endswith("..."))
         is_period  = (last_char == ".") and not is_ellipsis_tok
         is_hard    = last_char in hard_punct
 
-        # Also inspect punctuation on the *current* token
-        cur_token = cur.get("word","").strip()
-        cur_last  = cur_token[-1:] if cur_token else ""
-        cur_is_hard = cur_last in hard_punct  # e.g., "at?"
-        # Heuristic: next token looks like a sentence starter
-        cur_first = cur_token[:1]
-        cur_lc    = cur_token.lower()
+        cur_tok = cur.get("word","").strip()
+        cur_last= cur_tok[-1:] if cur_tok else ""
+        cur_is_hard = cur_last in hard_punct
+        cur_first = cur_tok[:1]
         cur_is_capital = bool(cur_first and cur_first.isupper())
-        cur_is_starter = cur_is_capital or cur_lc in {
+        cur_is_starter = cur_is_capital or cur_tok.lower() in {
             "who","what","why","when","where","how",
             "did","do","does","are","is","was","were",
             "can","could","will","would","should","shall","have","has","had","oh","well"
         }
-        # (we intentionally do NOT treat cur "."/ellipsis as hard here to keep your softer '.'/… rules)
 
         boundary = False
-        if gap >= gap_soft:
-            boundary = True
-        elif is_hard:
-            boundary = True
-        elif is_ellipsis_tok and gap >= gap_ellipsis:
-            boundary = True
-        elif is_period and gap >= gap_period:
-            boundary = True
-
-        # Soft ellipsis/period but likely new sentence (capital/question start) → force boundary
+        if gap >= gap_soft: boundary = True
+        elif is_hard:       boundary = True
+        elif is_ellipsis_tok and gap >= gap_ellipsis: boundary = True
+        elif is_period and gap >= gap_period:         boundary = True
         if not boundary and gap >= CAPITAL_BREAK_MIN_GAP and (is_ellipsis_tok or is_period) and cur_is_starter:
             boundary = True
 
         if boundary:
-            # If the *current* token carries a hard end mark (e.g., "at?"),
-            # attach it to the current sentence and flush *after* it.
             if cur_is_hard and buf:
                 buf.append(cur)
-                last_end = cur.get("end", last_end)
-                flush(force=True)
+                chunks.append((buf[0]["start"], buf[-1]["end"], buf_text()))
                 buf = []
-                # start fresh from next iteration
-                # (do not seed buf with cur here; we just flushed it)
                 continue
-            # Otherwise, split before 'cur' (previous behaviour)
-            if buf and buf_dur() < 1.0 and not buf_all_fillers():
-                # too short to flush; keep accumulating
+            if buf and buf_dur() < 1.0 and not all_fillers():
+                # keep accumulating until we reach 1s or punctuation
                 pass
             else:
-                flush(force=True)
+                chunks.append((buf[0]["start"], buf[-1]["end"], buf_text()))
                 buf = [cur]
-                cur_start = cur.get("start", prev.get("end", cur_start))
-                last_end  = cur.get("end", cur_start)
                 continue
-
         buf.append(cur)
-        last_end = cur.get("end", last_end)
-
-        if max_chars is not None and len(buf_text()) >= max_chars:
-            flush(force=True)
-            buf = []
 
     if buf:
-        if buf_dur() < 1.0 and not buf_all_fillers():
-            if chunks:
-                s, e, t = chunks[-1]
-                chunks[-1] = (s, buf[-1].get("end", e), (t + " " + buf_text()).strip())
-            else:
-                chunks.append((buf[0].get("start", 0.0), buf[-1].get("end", 0.0), buf_text()))
+        if buf_dur() < 1.0 and chunks:
+            s,e,t = chunks[-1]
+            chunks[-1] = (s, buf[-1]["end"], (t + " " + " ".join(w["word"] for w in buf)).strip())
         else:
-            chunks.append((buf[0].get("start", 0.0), buf[-1].get("end", 0.0), buf_text()))
+            chunks.append((buf[0]["start"], buf[-1]["end"], " ".join(w["word"] for w in buf)))
 
     out: List[Tuple[float,float,str]] = []
     for (s,e,txt) in chunks:
@@ -273,94 +237,32 @@ def smart_sentence_chunks_from_words(
             out.append((s,e,txt))
     return out
 
-
-def _strong_end(txt: str) -> bool:
-    """Hard end for global stitching: treat ? and ! as hard; '.' only if not an ellipsis."""
-    if not txt:
-        return False
-    t = txt.rstrip()
-    if t.endswith('!') or t.endswith('?'):
-        return True
-    # consider '...' or '…' as NOT a strong end (soft)
-    if t.endswith('...') or t.endswith('…'):
-        return False
-    return t.endswith('.')
-
-def _words_text_in_range(all_words, start_s, end_s):
-    """Rebuild text from words that OVERLAP the window, with a 5 ms tolerance."""
-    eps = 0.005
-    toks = []
+def words_text_in_range(all_words: List[Dict[str,Any]], start_s: float, end_s: float, eps: float=0.005) -> str:
+    toks=[]
     for w in all_words:
         ws = float(w.get("start", 0.0))
-        we = float(w.get("end", 0.0))
+        we = float(w.get("end",   0.0))
         if (ws < (end_s - eps)) and (we > (start_s + eps)):
-            toks.append(w.get("word", ""))
+            toks.append(w.get("word",""))
     return " ".join(toks).strip()
 
-def _stitch_extend_global(windows, stitch_gap_ms, extend_tail_ms, audio_duration_seconds,
-                                                pad_ms: int, join_guard_ms: int):
-    """windows: list of (s,e,txt) across the whole file, time-sorted."""
-    if not windows:
-        return windows
-    max_gap_s = stitch_gap_ms / 1000.0
-    extend_s  = extend_tail_ms / 1000.0
-    pad_s     = pad_ms / 1000.0
-    guard_s   = max(0.0, join_guard_ms / 1000.0)
+# -----------------------
+# IPA (optional)
+# -----------------------
 
-    # 1) stitch tiny gaps if no strong punctuation
-    stitched = []
-    for s, e, t in windows:
-        if stitched:
-            ps, pe, pt = stitched[-1]
-            gap = s - pe
-            if gap <= max_gap_s and not _strong_end(pt):
-                stitched[-1] = (ps, max(pe, e), (pt + " " + t).strip())
-                continue
-        stitched.append((s, e, t))
-    # 2) extend tails (leave 10 ms guard before next)
-    out = []
-    for i, (s, e, t) in enumerate(stitched):
-        next_start = stitched[i+1][0] if i+1 < len(stitched) else None
-        if next_start is None:
-            # last segment: allow extend but never beyond file end
-            e2 = min(e + extend_s, audio_duration_seconds)
-        else:
-            # Cap so that AFTER padding there is still a guard, i.e.:
-            # (e2 + pad_s) <= (next_start - pad_s - guard_s)
-            # -> e2 <= next_start - (2*pad_s + guard_s)
-            cap_no_overlap = next_start - (pad_s + guard_s)
-            # never shrink below original e; only extend
-            hard_cap = max(e, min(cap_no_overlap, next_start))
-            e2_req = e + extend_s
-            e2 = min(e2_req, hard_cap)
-            if e2 < e2_req - 1e-6:
-                logger.info("Tail extend clamped: req=%.3f cap=%.3f (pad=%.3f guard=%.3f next=%.3f)",
-                             e2_req, e2, pad_s, guard_s, next_start)
-        out.append((s, e2, t))
-    return out
-
-
-def phonemize_ipa(text: str, lang: str="en") -> str:
-    """
-    Optional IPA. If 'phonemizer' not installed, fallback to raw text.
-    Install: pip install phonemizer && apt-get install espeak-ng
-    """
+def phonemize_ipa(text: str, lang: str="en-us") -> str:
     global _PHONEMIZER_STATUS
-    # normalise common tags for espeak-ng
-    lang_key = lang.lower().replace("_", "-")
-    if lang_key == "en":
-        lang_key = "en-us"
     try:
         from phonemizer.backend import EspeakBackend
-        backend = EspeakBackend(language=lang_key)
+        backend = EspeakBackend(language=lang)
         ipa = backend.phonemize([text], strip=True, njobs=1)[0]
         if _PHONEMIZER_STATUS != "ok":
-            logger.info("Phonemizer: using EspeakBackend for '%s' (IPA enabled).", lang_key)
+            logger.info("Phonemizer: using EspeakBackend for '%s'.", lang)
             _PHONEMIZER_STATUS = "ok"
         return ipa
     except Exception as e:
         if _PHONEMIZER_STATUS != "fail":
-            logger.warning("Phonemizer unavailable or failed (%s); falling back to plain text.", e)
+            logger.warning("Phonemizer unavailable (%s); falling back to plain text.", e)
             _PHONEMIZER_STATUS = "fail"
         return text
 
@@ -375,223 +277,214 @@ def cut_sentences(
     out_wavs_dir: str | Path,
     manifest_path: str | Path,
     spk2id_path: str | Path,
+    *,
     vad_npy: Optional[str]=None,
-    vad_hop: Optional[float]=None,    # seconds, e.g., 0.02
+    vad_hop: Optional[float]=None,
     min_dur: float=1.0,
-    gap_thres: float=1.0,
+    gap_thres: float=1.2,
     period_gap: float=0.8,
-    ellipsis_gap: float=1.2,
+    ellipsis_gap: float=1.4,
     max_chars: Optional[int]=None,
     min_dur_singleton: float=0.30,
-    pad_ms: int=12,
+    pad_ms: int=20,
     mean_vad_thres: float=0.80,
-    overlap_policy: str="drop",       # "drop" | "dominant"
-    fade_ms: int=8,
-    lang_for_ipa: str="en",
+    overlap_policy: str="dominant",
+    fade_ms: int=10,
+    lang_for_ipa: str="en-us",
     qc_csv: Optional[str]=None,
-    stitch_gap_ms: int = 180,
-    extend_tail_ms: int = 120,
-    join_guard_ms: int = 10,
+    stitch_gap_ms: int = 0,
+    extend_tail_ms: int = 0,
+    join_guard_ms: int = 120,
 ):
-    """
-    Cuts PCM16 WAVs from 24k master by sentence windows and writes StyleTTS2 manifest.
-    """
     audio24k_path = Path(audio24k_path)
-    aligned = load_segments_aligned(aligned_json)
-    all_words = [w for seg in aligned for w in seg.get("words", [])]
+    segs = load_aligned_words(aligned_json)
+    all_words = [w for s in segs for w in s["words"]]
     spk_intvs = parse_rttm(rttm_path)
-    vad, hop = load_vad_probs(vad_npy, vad_hop)
-    sr24 = 24000
-    _outdir = Path(out_wavs_dir); _outdir.mkdir(parents=True, exist_ok=True)
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    man_f = open(manifest_path, "w", encoding="utf-8")
-    spk2id: Dict[str,int] = {}
-    qc_rows = []
 
-    # open once; slice reads per sentence (no full-file load)
+    sr24 = 24000
+    out_dir = Path(out_wavs_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    os.makedirs(Path(manifest_path).parent, exist_ok=True)
+
     sf_in = sf.SoundFile(str(audio24k_path), mode="r")
-    assert sf_in.samplerate == sr24, f"Expected 24k master, got {sf_in.samplerate}"
+    if sf_in.samplerate != sr24:
+        raise ValueError(f"Expected 24k WAV, got {sf_in.samplerate} Hz")
     total_frames = len(sf_in)
-    audio_duration_seconds = total_frames / float(sr24)
+    audio_dur = total_frames / float(sr24)
+
+    # 1) Build window candidates from words (per segment), then global merging if requested
+    pending = []
+    for s in segs:
+        words = s["words"]
+        pending.extend(
+            smart_sentence_chunks_from_words(
+                words,
+                gap_soft=gap_thres,
+                gap_period=period_gap,
+                gap_ellipsis=ellipsis_gap,
+                max_chars=max_chars,
+                min_dur_singleton=min_dur_singleton,
+            )
+        )
+    pending.sort(key=lambda x: x[0])
 
     def _strong_end(txt: str) -> bool:
-        """Hard end for global stitching: treat ? and ! as hard; '.' only if not an ellipsis."""
-        if not txt:
-            return False
+        if not txt: return False
         t = txt.rstrip()
-        if t.endswith('!') or t.endswith('?'):
-            return True
-        # consider '...' or '…' as NOT a strong end (soft)
-        if t.endswith('...') or t.endswith('…'):
-            return False
+        if t.endswith('!') or t.endswith('?'): return True
+        if t.endswith('...') or t.endswith('…'): return False
         return t.endswith('.')
 
-    def _apply_stitch_and_extend(windows: List[Tuple[float,float,str]]) -> List[Tuple[float,float,str]]:
-        """Merge tiny gaps (no strong end punct), then extend tail safely."""
-        if not windows:
-            return windows
-        max_gap_s = stitch_gap_ms / 1000.0
-        extend_s  = extend_tail_ms / 1000.0
-        # 1) stitch
-        stitched: List[Tuple[float,float,str]] = []
-        for s, e, t in windows:
+    # Stitch neighboring if desired
+    windows: List[Tuple[float,float,str]]
+    if stitch_gap_ms > 0 or extend_tail_ms > 0:
+        max_gap_s = stitch_gap_ms/1000.0
+        extend_s  = extend_tail_ms/1000.0
+        stitched=[]
+        for s,e,t in pending:
             if stitched:
-                ps, pe, pt = stitched[-1]
-                gap = s - pe
-                if gap <= max_gap_s and not _strong_end(pt):
-                    # merge
+                ps,pe,pt = stitched[-1]
+                if (s - pe) <= max_gap_s and not _strong_end(pt):
                     stitched[-1] = (ps, max(pe, e), (pt + " " + t).strip())
                     continue
-            stitched.append((s, e, t))
-        # 2) extend tails (leave tiny 10ms guard before next start)
-        out: List[Tuple[float,float,str]] = []
-        for i, (s, e, t) in enumerate(stitched):
-            next_start = stitched[i+1][0] if i+1 < len(stitched) else None
-            if next_start is None:
-                e2 = min(e + extend_s, audio_duration_seconds)
+            stitched.append((s,e,t))
+        out=[]
+        guard_s = join_guard_ms/1000.0
+        pad_s   = pad_ms/1000.0
+        for i,(s,e,t) in enumerate(stitched):
+            nxt = stitched[i+1][0] if i+1 < len(stitched) else None
+            if nxt is None:
+                e2 = min(e + extend_s, audio_dur)
             else:
-                e2 = min(e + extend_s, max(s, next_start - 0.010))
-            out.append((s, e2, t))
-        return out
+                # cap so that padded slices still leave guard
+                cap = max(e, nxt - (pad_s + guard_s))
+                e2 = min(e + extend_s, cap)
+            out.append((s,e2,t))
+        windows = out
+    else:
+        windows = pending
 
-    # Collect all windows across the whole file first
-    pending = []
-    for seg in aligned:
-        words = seg.get("words", [])
-        if not words:
-            continue
-        seg_windows = smart_sentence_chunks_from_words(
-            words,
-            gap_soft=gap_thres,
-            gap_period=period_gap,
-            gap_ellipsis=ellipsis_gap,
-            max_chars=max_chars,
-            min_dur_singleton=min_dur_singleton,
-        )
-        pending.extend(seg_windows)
+    if not windows:
+        logger.warning("No sentence windows built from aligned words. Check thresholds / input.")
+    logger.info("Candidate windows: %d", len(windows))
 
-    # Sort by time and apply global stitch/extend
-    pending.sort(key=lambda t: t[0])
-    audio_duration_seconds = len(sf_in) / float(sr24)
+    # Optional VAD posterior
+    vad: Optional[np.ndarray] = None
+    hop: Optional[float] = None
+    if vad_npy:
+        try:
+            arr = np.load(vad_npy)
+            if arr.ndim==2 and arr.shape[1]>1: arr = arr[:,1]
+            vad = arr.astype(np.float32)
+            hop = float(vad_hop) if vad_hop else None
+        except Exception as e:
+            logger.warning("Failed to load VAD npy: %s", e)
 
-    windows = _stitch_extend_global(
-        pending,
-        stitch_gap_ms=stitch_gap_ms,
-        extend_tail_ms=extend_tail_ms,
-        audio_duration_seconds=audio_duration_seconds,
-        pad_ms=pad_ms,
-        join_guard_ms=join_guard_ms,
-    )
+    def mean_vad_in_window(win: Tuple[float,float]) -> float:
+        s,e = win
+        dur = max(1e-9, e-s)
+        if vad is None or hop is None:
+            # proxy: speech coverage by union of all speakers
+            all_union = []
+            for ivs in spk_intvs.values():
+                all_union.extend(ivs)
+            cov = union_coverage_len((s,e), merge_intervals(sorted(all_union)))
+            return cov/dur
+        si = max(0, int(math.floor(s / hop)))
+        ei = min(len(vad), int(math.ceil(e / hop)))
+        if ei<=si: return 0.0
+        return float(np.mean(vad[si:ei]))
 
+    # 2) Filter, slice audio, write files + manifest + QC
+    spk2id: Dict[str,int] = {}
     seg_idx = 0
-    for idx, (s, e, _txt_premerge) in enumerate(windows):
-        # rebuild text from ALL words (post-merge), not just the segment-local buffer
-        sent_text = _words_text_in_range(all_words, s, e) or _txt_premerge
-        dur = e - s
-        if dur < min_dur:
-            continue
+    qc_rows = []
+    with open(manifest_path, "w", encoding="utf-8") as man_f:
+        for i,(s,e,txt_pre) in enumerate(windows):
+            txt = words_text_in_range(all_words, s, e) or txt_pre
+            dur = e - s
+            if dur < min_dur:
+                continue
 
-        # Speaker resolve & overlap detection
-        dom_spk, has_ovl, cover_map = dominant_speaker_and_overlap((s, e), spk_intvs, cover_thres=0.05)
+            dom_spk, has_ovl, _ = dominant_speaker_and_overlap((s,e), spk_intvs, cover_thres=0.05)
+            if has_ovl and overlap_policy == "drop":
+                continue
+            if dom_spk is None:
+                continue
 
-        if has_ovl and overlap_policy == "drop":
-            continue
-        if dom_spk is None:
-            # no speaker coverage; likely VAD misfire or non-speech
-            continue
+            mean_vad = mean_vad_in_window((s,e))
+            if mean_vad < mean_vad_thres:
+                continue
 
-        # VAD mean check: use posterior if available; else speech-coverage proxy
-        if vad is not None and hop is not None:
-            mean_vad = mean_vad_in_window(vad, hop, (s,e)) or 0.0
-        else:
-            cov = union_coverage_len((s,e), sum(spk_intvs.values(), []))  # union across speakers
-            mean_vad = cov / max(1e-9, dur)
+            if dom_spk not in spk2id:
+                spk2id[dom_spk] = len(spk2id)
 
-        if mean_vad < mean_vad_thres:
-            continue
-
-        # speaker id mapping (stable order)
-        if dom_spk not in spk2id:
-            spk2id[dom_spk] = len(spk2id)
-
-        # Read slice and write WAV (with short fades to avoid clicks)
-
-        pad = int(round((pad_ms/1000.0) * sr24)) if pad_ms > 0 else 0
-        guard_frames = int(round((join_guard_ms/1000.0) * sr24)) if join_guard_ms else 0
-        start_frame = max(0, int(round(s * sr24)) - pad)
-        next_start = windows[idx+1][0] if idx+1 < len(windows) else None
-        tail_plain = int(round(e * sr24))
-        tail_with_pad = tail_plain + pad
-        if next_start is not None:
-            next_start_frames = int(round(next_start * sr24))
-            if next_start_frames > tail_plain:
-                # no overlap: keep a tiny guard before next
-                end_cap = max(0, next_start_frames - guard_frames)
-                end_frame = min(total_frames, min(tail_with_pad, end_cap))
+            # compute padded/capped frame range (no overlap into next)
+            pad_frames   = int(round((pad_ms/1000.0)*sr24)) if pad_ms>0 else 0
+            guard_frames = int(round((join_guard_ms/1000.0)*sr24)) if join_guard_ms>0 else 0
+            start_frame  = max(0, int(round(s*sr24)) - pad_frames)
+            next_start   = windows[i+1][0] if i+1 < len(windows) else None
+            tail_plain   = int(round(e*sr24))
+            tail_withpad = tail_plain + pad_frames
+            if next_start is not None:
+                next_frames = int(round(next_start*sr24))
+                if next_frames > tail_plain:
+                    end_cap = max(0, next_frames - guard_frames)
+                    end_frame = min(total_frames, min(tail_withpad, end_cap))
+                else:
+                    end_frame = min(total_frames, tail_plain)
             else:
-                # overlap case: do NOT pad into next
-                end_frame = min(total_frames, tail_plain)
-        else:
-            end_frame = min(total_frames, tail_with_pad)
+                end_frame = min(total_frames, tail_withpad)
 
-        nframes = max(0, end_frame - start_frame)
-        if nframes <= 0: 
-            continue
+            nframes = max(0, end_frame - start_frame)
+            if nframes <= 0:
+                continue
 
-        sf_in.seek(start_frame)
-        audio = sf_in.read(frames=nframes, dtype="int16", always_2d=False)
+            sf_in.seek(start_frame)
+            audio = sf_in.read(frames=nframes, dtype="int16", always_2d=False)
 
-        # apply tiny linear fade-in/out on float, then convert back
-        if fade_ms > 0 and len(audio) > 0:
-            fade_len = int(sr24 * fade_ms / 1000.0)
-            fade_len = min(fade_len, len(audio)//2)
-            if fade_len > 0:
-                a = audio.astype(np.float32)
-                ramp_in  = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                ramp_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-                a[:fade_len] *= ramp_in
-                a[-fade_len:] *= ramp_out
-                audio = np.clip(np.round(a), -32768, 32767).astype(np.int16)
+            # tiny fade to avoid clicks
+            if fade_ms>0 and len(audio)>0:
+                fade_len = int(sr24*fade_ms/1000.0)
+                fade_len = min(fade_len, len(audio)//2)
+                if fade_len>0:
+                    a = audio.astype(np.float32)
+                    a[:fade_len]  *= np.linspace(0.0,1.0,fade_len, dtype=np.float32)
+                    a[-fade_len:] *= np.linspace(1.0,0.0,fade_len, dtype=np.float32)
+                    audio = np.clip(np.round(a), -32768, 32767).astype(np.int16)
 
-        wav_name = f"utt_{seg_idx:06d}_spk{spk2id[dom_spk]}.wav"
-        wav_path = _outdir / wav_name
-        sf.write(str(wav_path), audio, sr24, subtype="PCM_16")
+            wav_name = f"utt_{seg_idx:06d}_spk{spk2id[dom_spk]}.wav"
+            wav_path = out_dir / wav_name
+            sf.write(str(wav_path), audio, sr24, subtype="PCM_16")
 
-        # IPA (optional; fallback to text)
-        ipa = phonemize_ipa(sent_text, lang_for_ipa)
-        rel = wav_name  # relative to out_wavs_dir
-        man_f.write(f"{rel} | {ipa} | {spk2id[dom_spk]}\n")
+            ipa_or_text = phonemize_ipa(txt, lang_for_ipa) if txt else ""
+            man_f.write(f"{wav_name} | {ipa_or_text} | {spk2id[dom_spk]}\n")
 
-        # QC row — use *padded* times so CSV matches the WAV exactly
-        start_s_padded = round(start_frame / sr24, 3)
-        end_s_padded   = round(end_frame   / sr24, 3)
-        qc_rows.append({
-            "utt": wav_name,
-            "spk_name": dom_spk,
-            "spk_id": spk2id[dom_spk],
-            "start": start_s_padded,
-            "end": end_s_padded,
-            "dur": round(end_s_padded - start_s_padded, 3),
-            "mean_vad": round(mean_vad, 3),
-            "overlap": int(has_ovl),
-            "text": sent_text,
-        })
-        seg_idx += 1
+            # QC uses padded/capped times for transparency
+            s_pad = round(start_frame/sr24, 3)
+            e_pad = round(end_frame  /sr24, 3)
+            qc_rows.append({
+                "utt": wav_name,
+                "spk_name": dom_spk,
+                "spk_id": spk2id[dom_spk],
+                "start": s_pad,
+                "end": e_pad,
+                "dur": round(e_pad-s_pad, 3),
+                "mean_vad": round(mean_vad,3),
+                "overlap": int(has_ovl),
+                "text": txt,
+            })
+            seg_idx += 1
 
     sf_in.close()
-    man_f.close()
 
-    # spk2id.json
     with open(spk2id_path, "w", encoding="utf-8") as f:
         json.dump(spk2id, f, indent=2)
 
-    # qc.csv (optional)
     if qc_csv:
-        os.makedirs(os.path.dirname(qc_csv), exist_ok=True)
+        os.makedirs(Path(qc_csv).parent, exist_ok=True)
         with open(qc_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(qc_rows[0].keys()) if qc_rows else
-                               ["utt","spk_name","spk_id","start","end","dur","mean_vad","overlap","text"])
-            w.writeheader()
+            cols = ["utt","spk_name","spk_id","start","end","dur","mean_vad","overlap","text"]
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
             for r in qc_rows: w.writerow(r)
 
     print(f"Done. Wrote {seg_idx} WAVs to {out_wavs_dir}")
@@ -604,32 +497,33 @@ def cut_sentences(
 # -----------------------
 
 def build_argparser():
-    p = argparse.ArgumentParser(description="Cut sentence WAVs for StyleTTS2.")
-    p.add_argument("--audio24k", required=True, help="24 kHz mono WAV (trimmed mirror of proxy)")
-    p.add_argument("--aligned_json", required=True, help="WhisperX segments_aligned.json")
-    p.add_argument("--rttm", required=True, help="NeMo RTTM path")
+    p = argparse.ArgumentParser(description="Sentence cutter (no WhisperX deps).")
+    p.add_argument("--audio24k", required=True, help="24 kHz mono WAV")
+    p.add_argument("--aligned_json", required=True, help="Aligned JSON with top-level 'utterances' or 'segments'")
+    p.add_argument("--rttm", required=True, help="NeMo diarization RTTM")
     p.add_argument("--out_wavs_dir", required=True)
     p.add_argument("--manifest_path", required=True)
     p.add_argument("--spk2id_path", required=True)
-    p.add_argument("--vad_npy", default=None, help="Optional VAD posterior .npy")
-    p.add_argument("--vad_hop", type=float, default=None, help="VAD hop in seconds (e.g., 0.02)")
+    p.add_argument("--vad_npy", default=None)
+    p.add_argument("--vad_hop", type=float, default=None)
+
     p.add_argument("--min_dur", type=float, default=1.0)
-    p.add_argument("--gap_thres", type=float, default=1.0)
-    p.add_argument("--period_gap", type=float, default=0.8, help="Gap needed after '.' to split.")
-    p.add_argument("--ellipsis_gap", type=float, default=1.2, help="Gap needed after '...'/'…' to split.")
-    p.add_argument("--max_chars", type=int, default=None, help="Optional cap on characters per sentence.")
-    p.add_argument("--min_dur_singleton", type=float, default=0.30, help="Keep filler-only utterances down to this.")
-    p.add_argument("--pad_ms", type=int, default=12, help="Pad each cut on both sides (ms).")
+    p.add_argument("--gap_thres", type=float, default=1.2)
+    p.add_argument("--period_gap", type=float, default=0.8)
+    p.add_argument("--ellipsis_gap", type=float, default=1.4)
+    p.add_argument("--max_chars", type=int, default=None)
+    p.add_argument("--min_dur_singleton", type=float, default=0.30)
+
+    p.add_argument("--pad_ms", type=int, default=20)
     p.add_argument("--mean_vad_thres", type=float, default=0.80)
     p.add_argument("--overlap_policy", choices=["drop","dominant"], default="dominant")
-    p.add_argument("--fade_ms", type=int, default=8)
+    p.add_argument("--fade_ms", type=int, default=10)
     p.add_argument("--lang_for_ipa", default="en-us")
-    p.add_argument("--stitch_gap_ms", type=int, default=180,
-                   help="If gap between consecutive segments < this, merge them (no strong end punctuation).")
-    p.add_argument("--extend_tail_ms", type=int, default=120,
-                   help="Extend each segment tail by this much unless it overruns the next segment.")
-    p.add_argument("--join_guard_ms", type=int, default=10,
-                   help="Extra guard between padded slices to ensure no overlap.")
+
+    p.add_argument("--stitch_gap_ms", type=int, default=0)
+    p.add_argument("--extend_tail_ms", type=int, default=0)
+    p.add_argument("--join_guard_ms", type=int, default=120)
+
     p.add_argument("--qc_csv", default=None)
     return p
 
