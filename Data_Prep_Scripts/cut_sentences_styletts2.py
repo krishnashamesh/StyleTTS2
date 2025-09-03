@@ -24,7 +24,7 @@ Outputs:
 from __future__ import annotations
 import argparse, csv, json, math, os, re, logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -96,11 +96,24 @@ def _load_punct_source_text(path: str | Path) -> Optional[str]:
         logger.warning("punct_source not found: %s", path)
         return None
     try:
-        # support manifest.json (single JSON line) or transcript.jsonl (first line)
-        txt = p.read_text(encoding="utf-8").splitlines()
-        line = txt[0] if txt else ""
-        obj = json.loads(line)
-        return obj.get("text", "") or ""
+        raw = p.read_text(encoding="utf-8").strip()
+        # Try JSONL (first non-empty line)
+        first_line = next((ln for ln in raw.splitlines() if ln.strip()), "")
+        try:
+            obj = json.loads(first_line)
+            t = obj.get("text", "") if isinstance(obj, dict) else ""
+            if t: return t
+        except Exception:
+            pass
+        # Try pretty JSON (object or list)
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj.get("text", "") or ""
+        if isinstance(obj, list):
+            for rec in obj:
+                if isinstance(rec, dict) and rec.get("text"):
+                    return rec["text"]
+        return None
     except Exception as e:
         logger.warning("Failed to read punct_source %s (%s)", path, e)
         return None
@@ -122,6 +135,18 @@ def _align_global(all_words_norm: List[str], src_words_norm: List[str]):
             # else: leave unmapped; will fallback later
     return map_a_to_b
 
+# ----- helpers for locality-aware graft + validation -----
+def _norm_for_compare(s: str) -> str:
+    """Lowercase, collapse spaces, strip non-word (keep apostrophes)."""
+    t = s.lower()
+    t = _ELLIPSIS_RE.sub("...", t)
+    t = re.sub(r"[^\w'\s]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+def _seq_ratio(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    return SequenceMatcher(a=_norm_for_compare(a), b=_norm_for_compare(b)).ratio()
+
 def _words_indices_in_range(all_words: List[Dict[str,Any]], s: float, e: float, eps: float=0.005) -> List[int]:
     out = []
     for w in all_words:
@@ -130,14 +155,38 @@ def _words_indices_in_range(all_words: List[Dict[str,Any]], s: float, e: float, 
             out.append(w["__idx"])
     return out
 
+
+# Coverage-gated word selection (drop boundary slivers)
+def _filter_idxs_by_coverage(
+    idxs: List[int],
+    all_words: List[Dict[str,Any]],
+    s: float, e: float,
+    min_cov: float = 0.50,
+    min_ms: int = 80,
+) -> Tuple[List[int], List[int]]:
+    keep, drop = [], []
+    min_s = max(0.0, float(min_ms) / 1000.0)
+    for i in idxs:
+        w = all_words[i]
+        ws = w.get("start", None); we = w.get("end", None)
+        if ws is None or we is None: continue
+        inter = max(0.0, min(e, we) - max(s, ws))
+        dur   = max(1e-6, we - ws)
+        if (inter >= min_s) or (inter / dur >= min_cov):
+            keep.append(i)
+        else:
+            drop.append(i)
+    return keep, drop
+
 def _graft_text_for_window(
     idxs: List[int],
     all_words: List[Dict[str,Any]],
     map_idx_to_src: Dict[int,int],
     src_tokens: List[Dict[str,Any]],
     src_word_to_tok: List[int],
-) -> Optional[str]:
-    """Reconstruct cased+punctuated text slice by spanning the src token range covering mapped words."""
+    return_meta: bool = False,
+) -> Optional[Union[str, Tuple[str, Dict[str, Any]]]]:
+    """Reconstruct cased+punctuated text covering mapped words; return meta if requested."""
     src_idxs = [map_idx_to_src.get(i) for i in idxs if i in map_idx_to_src]
     if not src_idxs:
         return None
@@ -165,8 +214,97 @@ def _graft_text_for_window(
                 out.append(" " + tk["text"])
             else:
                 out.append(tk["text"])
-    return "".join(out).strip()
- 
+    # return text + debug breadcrumbs about the chosen src word span
+
+    text = "".join(out).strip()
+    if return_meta:
+        meta = {"mode":"global","src_lo":lo,"src_hi":hi,"t0":t0,"t1":t1}
+        return text, meta
+    return text
+
+
+def _graft_text_for_window_local(
+    idxs: List[int],
+    all_words: List[Dict[str,Any]],
+    src_tokens: List[Dict[str,Any]],
+    src_word_to_tok: List[int],
+    src_words_norm: List[str],
+    radius_words: int = 80,
+    return_meta: bool = False,
+) -> Optional[Union[str, Tuple[str, Dict[str, Any]]]]:
+    """Local re-alignment near mapped anchor; return alignment diagnostics if requested."""
+    if not idxs:
+        return None
+    # window words (normalized sequence)
+    win_words = [all_words[i]["__norm"] for i in idxs]
+    if len(win_words) == 0:
+        return None
+
+    # estimate anchor via the first successfully mapped index (fallback to middle)
+    mapped = [i for i in idxs if "__src_idx" in all_words[i]]
+    if mapped:
+        anchor_src = int(np.median([all_words[i]["__src_idx"] for i in mapped]))
+    else:
+        anchor_src = None
+
+    # define local search slice in src_words_norm
+    if anchor_src is None:
+        lo = 0
+        hi = len(src_words_norm)
+    else:
+        lo = max(0, anchor_src - radius_words)
+        hi = min(len(src_words_norm), anchor_src + radius_words)
+    if hi - lo < 5:
+        return None
+
+    from difflib import SequenceMatcher
+    sm = SequenceMatcher(a=win_words, b=src_words_norm[lo:hi], autojunk=False)
+    # find best matching contiguous block in the local window
+    best = None
+    for tag, a0, a1, b0, b1 in sm.get_opcodes():
+        if tag == "equal":
+            span = (a1 - a0)
+            if span >= 2:  # require at least a couple of words
+                score = span
+                if (best is None) or (score > best[0]):
+                    best = (score, b0, b1)
+    if best is None:
+        # fall back to the whole local window via overall ratio
+        # take the longest b-span suggested by matcher even if not 'equal'
+        b0 = 0; b1 = 0
+        maxspan = -1
+        for tag, a0, a1, bb0, bb1 in sm.get_opcodes():
+            span = bb1 - bb0
+            if span > maxspan:
+                maxspan = span; b0 = bb0; b1 = bb1
+        if maxspan <= 0:
+            return None
+    else:
+        _, b0, b1 = best
+    # map back to token indices and reconstruct with punctuation
+    try:
+        t0 = src_word_to_tok[lo + b0]
+        t1 = src_word_to_tok[min(lo + b1 - 1, len(src_word_to_tok)-1)]
+    except Exception:
+        return None
+    toks = src_tokens[t0:t1+1]
+    out = []
+    for tk in toks:
+        if tk["type"] == "punct":
+            if out: out[-1] = out[-1] + tk["text"]
+            else:   out.append(tk["text"])
+        else:
+            out.append(((" " if out else "") + tk["text"]))
+
+    # return text + debug breadcrumbs: resolved local source word span and anchor
+    meta = {"mode": "local", "src_lo": lo + b0, "src_hi": lo + b1 - 1, "anchor_src": (anchor_src if anchor_src is not None else -1)}
+    text = "".join(out).strip()
+    if return_meta:
+        meta = {"mode":"local","anchor_src":(anchor_src if anchor_src is not None else -1),
+                "src_lo": lo + b0, "src_hi": lo + b1 - 1, "lo":lo, "hi":hi, "b0":b0, "b1":b1, "t0":t0, "t1":t1}
+        return text, meta
+    return text
+
 # -----------------------
 # JSON loaders (robust)
 # -----------------------
@@ -431,7 +569,7 @@ def cut_sentences(
     *,
     punct_mode: str = "graft",
     punct_source: Optional[str] = None,
-    manifest_field: str = "ipa",
+    manifest_field: str = "text",
     vad_npy: Optional[str]=None,
     vad_hop: Optional[float]=None,
     min_dur: float=1.0,
@@ -442,16 +580,32 @@ def cut_sentences(
     min_dur_singleton: float=0.30,
     pad_ms: int=20,
     mean_vad_thres: float=0.80,
-    overlap_policy: str="dominant",
+    overlap_policy: str="drop",
     fade_ms: int=10,
     lang_for_ipa: str="en-us",
+    speaker_purity_min: float = 0.90,
+    breadcrumbs: Optional[str] = None,
     qc_csv: Optional[str]=None,
     stitch_gap_ms: int = 0,
     extend_tail_ms: int = 0,
     join_guard_ms: int = 120,
+    word_min_cov: float=0.50,
+    word_min_ms: int=80,
+    graft_min_sim: float = 0.60,
+    graft_local_radius: int = 80,
 ):
     audio24k_path = Path(audio24k_path)
+
     segs = load_aligned_words(aligned_json)
+    # Breadcrumbs writer
+    crumb_f = open(breadcrumbs, "w", encoding="utf-8") if breadcrumbs else None
+    def _crumb(event: str, **kw):
+        if crumb_f:
+            rec = {"event": event, **kw}
+            try:
+                crumb_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     all_words = []
     for s in segs:
@@ -462,6 +616,14 @@ def cut_sentences(
             all_words.append(w)
 
     spk_intvs = parse_rttm(rttm_path)
+    _crumb("config",
+           audio=str(audio24k_path), aligned_json=str(aligned_json), rttm=str(rttm_path),
+           out_wavs_dir=str(out_wavs_dir), manifest=str(manifest_path),
+           punct_mode=punct_mode, punct_source=punct_source, manifest_field=manifest_field,
+           overlap_policy=overlap_policy, mean_vad_thres=mean_vad_thres,
+           pad_ms=pad_ms, join_guard_ms=join_guard_ms,
+           graft_min_sim=graft_min_sim, graft_local_radius=graft_local_radius,
+           speaker_purity_min=speaker_purity_min,word_min_cov=word_min_cov, word_min_ms=word_min_ms)
 
     sr24 = 24000
     out_dir = Path(out_wavs_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -543,6 +705,7 @@ def cut_sentences(
     if not windows:
         logger.warning("No sentence windows built from aligned words. Check thresholds / input.")
     logger.info("Candidate windows: %d", len(windows))
+    _crumb("windows_built", count=len(windows))
 
  
     # Build punctuation graft context if requested
@@ -566,6 +729,11 @@ def cut_sentences(
                 if not graft_ready:
                     logger.warning("Could not build alignment to punctuation source; falling back to 'none'")
                     punct_mode = "none"
+                else:
+                    # stash per-word src indices to enable local anchoring
+                    for w in all_words:
+                        if w["__idx"] in map_idx_to_src:
+                            w["__src_idx"] = map_idx_to_src[w["__idx"]]
 
 
     # Optional VAD posterior
@@ -595,13 +763,8 @@ def cut_sentences(
         if ei<=si: return 0.0
         return float(np.mean(vad[si:ei]))
 
-    # Speaker purity threshold (final guard)
-    purity_min = 0.90
-    try:
-        # read from CLI if provided (see arg parser changes below)
-        purity_min = float(os.environ.get("CUT_SPEAKER_PURITY_MIN", "0.90"))
-    except Exception:
-        pass
+    # Speaker purity threshold (from CLI)
+    purity_min = speaker_purity_min
 
     # 3) Filter, slice audio, write files + manifest + QC
     spk2id: Dict[str,int] = {}
@@ -610,21 +773,76 @@ def cut_sentences(
     with open(manifest_path, "w", encoding="utf-8") as man_f:
         for i,(s,e,txt_pre) in enumerate(windows):
 
-            # base normalized text from timed words
-            txt_norm = " ".join(
-                w["word"] for w in all_words
-                if (w["start"] < (e - 0.005)) and (w["end"] > (s + 0.005))
-            ).strip() or txt_pre
-            # choose display text according to punct_mode
+            # base normalized text from coverage-gated words
+            idxs_all = _words_indices_in_range(all_words, s, e)
+            idxs, _dropped = _filter_idxs_by_coverage(
+                idxs_all, all_words, s, e,
+                min_cov=word_min_cov, min_ms=word_min_ms
+            )
+            txt_norm = " ".join(all_words[j]["word"] for j in idxs).strip() or txt_pre
+            # choose display text according to punct_mode (with locality + validation)
             display_text = txt_norm
+            dbg_graft = None
+            dbg_sim = None
+            # breadcrumbs
+            dbg_mode: str = ""
+            dbg_src_lo: Optional[int] = None
+            dbg_src_hi: Optional[int] = None
+            dbg_anchor: Optional[int] = None
+            # content-ish words inside this window (exclude fillers/1-char)
+            idxs_all = _words_indices_in_range(all_words, s, e)
+            _content = [w for j,w in enumerate(all_words) if j in idxs_all
+                        if len((w.get("word","").strip())) >= 2 and not _is_filler(w.get("word",""))]
+            dbg_content_n = len(_content)
+
             if punct_mode == "graft" and graft_ready:
-                idxs = _words_indices_in_range(all_words, s, e)
-                graft = _graft_text_for_window(idxs, all_words, map_idx_to_src, src_tokens, src_word_to_tok)
-                if graft and len(graft) >= max(1, int(0.6*len(txt_norm))):
-                    display_text = graft
-                else:
-                    # soft fallback: capitalize first token if sentence-like
+                # ---- Hard guard: skip graft if window is too flimsy ----
+                _chars = sum(len(w.get("word","").strip()) for j,w in enumerate(all_words) if j in idxs)
+                _dur   = (all_words[idxs[-1]]["end"] - all_words[idxs[0]]["start"]) if idxs else 0.0
+                fragile = (dbg_content_n < 3) or (_chars < 8) or (_dur < 1.2)
+                if fragile:
                     display_text = txt_norm[:1].upper() + txt_norm[1:] if txt_norm else txt_norm
+                    _crumb("graft_skip_fragile", i=i, s=round(s,3), e=round(e,3),
+                           content=dbg_content_n, chars=_chars, dur=round(_dur,3))
+                else:
+                    # 1) locality-aware graft (preferred)
+                    graft_meta = None
+                    g = _graft_text_for_window_local(
+                        idxs, all_words, src_tokens, src_word_to_tok, src_words_norm,
+                        radius_words=graft_local_radius, return_meta=True
+                    )
+                    if isinstance(g, tuple): graft, graft_meta = g
+                    else:                    graft = g
+                    # 2) global fallback
+                    if not graft:
+                        g = _graft_text_for_window(
+                            idxs, all_words, map_idx_to_src, src_tokens, src_word_to_tok, return_meta=True
+                        )
+                        if isinstance(g, tuple): graft, graft_meta = g
+                        else:                    graft = g
+                    if graft:
+                        dbg_graft = graft
+                        dbg_sim = _seq_ratio(graft, txt_norm)
+                        accepted = bool(dbg_sim >= graft_min_sim)
+                        if accepted:
+                            display_text = graft
+                        else:
+                            display_text = txt_norm[:1].upper() + txt_norm[1:] if txt_norm else txt_norm
+                        
+                        if graft_meta and isinstance(graft_meta, dict):
+                            dbg_mode   = graft_meta.get("mode","")
+                            dbg_src_lo = graft_meta.get("src_lo")
+                            dbg_src_hi = graft_meta.get("src_hi")
+                            dbg_anchor = graft_meta.get("anchor_src")
+
+                        _crumb("graft", i=i, s=round(s,3), e=round(e,3),
+                            sim=round(float(dbg_sim),3), accepted=accepted,
+                            mode=(graft_meta.get("mode") if graft_meta else None),
+                            meta=graft_meta, txt_norm=txt_norm, text_graft=graft)
+                    else:
+                        display_text = txt_norm[:1].upper() + txt_norm[1:] if txt_norm else txt_norm
+                        _crumb("graft_miss", i=i, s=round(s,3), e=round(e,3), txt_norm=txt_norm)
+
             elif punct_mode == "restore":
                 display_text = _restore_punct_and_case(txt_norm)
             else:
@@ -638,8 +856,10 @@ def cut_sentences(
 
             dom_spk, has_ovl, cover = dominant_speaker_and_overlap((s,e), spk_intvs, cover_thres=0.05)
             if has_ovl and overlap_policy == "drop":
+                _crumb("drop_overlap", i=i, s=round(s,3), e=round(e,3))
                 continue
             if dom_spk is None:
+                _crumb("drop_no_speaker", i=i, s=round(s,3), e=round(e,3))
                 continue
 
             # enforce purity
@@ -655,18 +875,20 @@ def cut_sentences(
                 did_split = False
                 for cp in cut_pts:
                     if (cp - s) > 0.35 and (e - cp) > 0.35:
-                        # split into two sub-windows by revisiting the queue (simple approach: skip/continue)
-                        pending.append((s, cp, txt_pre))
-                        pending.append((cp, e, txt_pre))
+                        # in-place split so the new windows are processed immediately
+                        windows[i:i+1] = [(s, cp, txt_pre), (cp, e, txt_pre)]
+
                         did_split = True
                         break
                 if did_split:
+                    _crumb("surgical_split", i=i, s=round(s,3), e=round(e,3), cp=round(cp,3))
                     continue
                 # else drop mixed window
                 continue
 
             mean_vad = mean_vad_in_window((s,e))
             if mean_vad < mean_vad_thres:
+                _crumb("drop_vad", i=i, s=round(s,3), e=round(e,3), mean_vad=float(mean_vad))
                 continue
 
             if dom_spk not in spk2id:
@@ -715,10 +937,16 @@ def cut_sentences(
             else:
                 field_val = display_text
             man_f.write(f"{wav_name} | {field_val} | {spk2id[dom_spk]}\n")
-
             # QC uses padded/capped times for transparency
             s_pad = round(start_frame/sr24, 3)
             e_pad = round(end_frame  /sr24, 3)
+
+            # also log raw window boundaries in ms (pre-pad) as breadcrumbs
+            win_start_ms = int(round(s * 1000.0))
+            win_end_ms   = int(round(e * 1000.0))
+            # choose a human-friendly graft mode string when not in 'graft'
+            qc_mode = dbg_mode if dbg_mode else ("restore" if punct_mode=="restore" else ("none" if punct_mode in ("none","time") else ""))
+
             qc_rows.append({
                 "utt": wav_name,
                 "spk_name": dom_spk,
@@ -726,11 +954,27 @@ def cut_sentences(
                 "start": s_pad,
                 "end": e_pad,
                 "dur": round(e_pad-s_pad, 3),
+                "win_start_ms": win_start_ms,
+                "win_end_ms": win_end_ms,
                 "mean_vad": round(mean_vad,3),
                 "overlap": int(has_ovl),
                 "text": display_text,
+                "text_norm": txt_norm,
+                "text_graft": dbg_graft if dbg_graft is not None else "",
+                "graft_sim": round(dbg_sim, 3) if dbg_sim is not None else "",
+                "graft_mode": qc_mode,
+                "src_anchor_idx": (dbg_anchor if (dbg_anchor is not None and dbg_anchor >= 0) else ""),
+                "src_span_lo": (dbg_src_lo if dbg_src_lo is not None else ""),
+                "src_span_hi": (dbg_src_hi if dbg_src_hi is not None else ""),
+                "content_words": dbg_content_n,
             })
             seg_idx += 1
+
+            _crumb("emit", utt=wav_name, spk_name=dom_spk, spk_id=spk2id[dom_spk],
+                start=s_pad, end=e_pad, dur=round(e_pad - s_pad,3),
+                text=display_text, text_norm=txt_norm, text_graft=(dbg_graft or ""),
+                graft_sim=(round(float(dbg_sim),3) if dbg_sim is not None else None))
+
 
     sf_in.close()
 
@@ -739,15 +983,26 @@ def cut_sentences(
 
     if qc_csv:
         os.makedirs(Path(qc_csv).parent, exist_ok=True)
+
         with open(qc_csv, "w", newline="", encoding="utf-8") as f:
-            cols = ["utt","spk_name","spk_id","start","end","dur","mean_vad","overlap","text"]
+            cols = [
+                "utt","spk_name","spk_id",
+                "start","end","dur","win_start_ms","win_end_ms",
+                "mean_vad","overlap",
+                "text","text_norm","text_graft","graft_sim","graft_mode",
+                "src_anchor_idx","src_span_lo","src_span_hi",
+                "content_words"
+            ]
+
             w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
             for r in qc_rows: w.writerow(r)
 
+    _crumb("summary", emitted=seg_idx)
     print(f"Done. Wrote {seg_idx} WAVs to {out_wavs_dir}")
     print(f"Manifest: {manifest_path}")
     print(f"spk2id:   {spk2id_path}")
     if qc_csv: print(f"QC CSV:   {qc_csv}")
+    if crumb_f: crumb_f.close()
 
 # -----------------------
 # CLI
@@ -768,7 +1023,7 @@ def build_argparser():
                    help="How to obtain punctuated+capitalized text for manifest.")
     p.add_argument("--punct_source", default=None,
                    help="Parakeet text source (manifest.json or transcript.jsonl) for 'graft'/'time' modes.")
-    p.add_argument("--manifest_field", choices=["ipa","text"], default="ipa",
+    p.add_argument("--manifest_field", choices=["ipa","text"], default="text",
                    help="Which field to write into train_list.txt: IPA (phonemized) or text.")
 
     p.add_argument("--min_dur", type=float, default=1.0)
@@ -780,13 +1035,21 @@ def build_argparser():
 
     p.add_argument("--pad_ms", type=int, default=20)
     p.add_argument("--mean_vad_thres", type=float, default=0.80)
-    p.add_argument("--overlap_policy", choices=["drop","dominant"], default="dominant")
+    p.add_argument("--overlap_policy", choices=["drop","dominant"], default="drop")
     p.add_argument("--fade_ms", type=int, default=10)
     p.add_argument("--lang_for_ipa", default="en-us")
 
     p.add_argument("--stitch_gap_ms", type=int, default=0)
     p.add_argument("--extend_tail_ms", type=int, default=0)
     p.add_argument("--join_guard_ms", type=int, default=120)
+    p.add_argument("--word_min_cov", type=float, default=0.50,
+                   help="Minimum fraction of a word that must lie within the window to keep it.")
+    p.add_argument("--word_min_ms", type=int, default=80,
+                   help="Or, minimum milliseconds of a word that must lie within the window.")
+    p.add_argument("--graft_min_sim", type=float, default=0.60,
+                   help="Reject graft if normalized similarity to window text is below this.")
+    p.add_argument("--graft_local_radius", type=int, default=80,
+                   help="Locality radius (in words) around the mapped anchor for graft.")
 
     p.add_argument("--split_on_speaker_change", action="store_true", default=True,
                    help="Break sentences when speaker label changes (recommended).")
@@ -794,6 +1057,8 @@ def build_argparser():
                    help="Min fraction of a single speaker's coverage required inside a cut.")
 
     p.add_argument("--qc_csv", default=None)
+    p.add_argument("--breadcrumbs", default=None,
+                   help="Write per-utterance JSONL breadcrumbs for debugging.")
     return p
 
 def main():
@@ -821,10 +1086,16 @@ def main():
         overlap_policy=args.overlap_policy,
         fade_ms=args.fade_ms,
         lang_for_ipa=args.lang_for_ipa,
+        word_min_cov=args.word_min_cov,
+        word_min_ms=args.word_min_ms,
+        speaker_purity_min=args.speaker_purity_min,
+        breadcrumbs=args.breadcrumbs,
         qc_csv=args.qc_csv,
         stitch_gap_ms=args.stitch_gap_ms,
         extend_tail_ms=args.extend_tail_ms,
         join_guard_ms=args.join_guard_ms,
+        graft_min_sim=args.graft_min_sim,
+        graft_local_radius=args.graft_local_radius,
     )
 
 if __name__ == "__main__":
