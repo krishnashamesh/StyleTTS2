@@ -132,7 +132,7 @@ def compute_style(ref_dicts):
 import phonemizer
 global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True, with_stress=True, words_mismatch='ignore')
 
-config = yaml.safe_load(open("Models/VCTK/config.yml"))
+config = yaml.safe_load(open("Models/Custom_Data/config.yml"))
 
 # load pretrained ASR model
 ASR_config = config.get('ASR_config', False)
@@ -159,7 +159,7 @@ if MULTISPEAKER:
 else:
     print("[ms] Single-speaker mode (no reference features required).")
 
-params_whole = torch.load("Models/VCTK/epoch_2nd_00004.pth")
+params_whole = torch.load("Models/Custom_Data/epoch_2nd_00004.pth")
 params = params_whole['net']
 
 for key in model:
