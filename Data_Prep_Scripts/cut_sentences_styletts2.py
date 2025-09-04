@@ -707,6 +707,77 @@ def cut_sentences(
     logger.info("Candidate windows: %d", len(windows))
     _crumb("windows_built", count=len(windows))
 
+
+    # ---------- Optional time-bucket packing (min=1, target=8, max=10 s) ----------
+    def _pack_time_buckets(win_list, target: float, bmin: float, bmax: float, prefer_sil_ms: int):
+        """
+        Greedy packer over (s,e,txt) windows:
+          * accumulate until >= bmin
+          * prefer endpoints preceded by >= prefer_sil_ms gap
+          * cap at bmax (or nearest boundary)
+        Returns list of merged (s,e,txt) windows.
+        """
+        out = []
+        i = 0
+        while i < len(win_list):
+            j = i
+            s = win_list[i][0]
+            best_j = None
+            best_over = 1e9
+            while j < len(win_list):
+                e = win_list[j][1]
+                dur = e - s
+                if dur > bmax:
+                    if best_j is not None:
+                        j = best_j
+                    break
+                # gap before this boundary (prefer a silence)
+                nice_sil = False
+                if j > i:
+                    gap_ms = max(0.0, (win_list[j][0] - win_list[j-1][1])) * 1000.0
+                    nice_sil = gap_ms >= prefer_sil_ms
+                if dur >= bmin:
+                    over = abs(dur - target)
+                    if nice_sil and over <= best_over:
+                        best_over = over; best_j = j
+                    elif best_j is None and over < best_over:
+                        best_over = over; best_j = j
+                j += 1
+            if best_j is None:
+                best_j = max(i, min(j-1, len(win_list)-1))
+            # merge text across [i..best_j]
+            s = win_list[i][0]; e = win_list[best_j][1]
+            merged_txt = " ".join(t for _,__,t in win_list[i:best_j+1]).strip()
+            out.append((s,e,merged_txt))
+            i = best_j + 1
+        return out
+
+    # switch to bucketed windows if requested
+    bucket_mode = False  # default; will be wired to CLI below
+    try:
+        # presence of attrs means we were invoked via the CLI wrapper in this file
+        bucket_mode = bool(args.bucket_mode)
+        if bucket_mode:
+            windows = _pack_time_buckets(
+                windows,
+                target=getattr(args, "bucket_target", 8.0),
+                bmin=getattr(args, "bucket_min", 1.0),
+                bmax=getattr(args, "bucket_max", 10.0),
+                prefer_sil_ms=getattr(args, "bucket_silence_ms", 700),
+            )
+            logger.info("Bucketed windows: %d (target=%.1fs, min=%.1fs, max=%.1fs)",
+                        len(windows),
+                        getattr(args, "bucket_target", 8.0),
+                        getattr(args, "bucket_min", 1.0),
+                        getattr(args, "bucket_max", 10.0))
+            _crumb("windows_bucketed", count=len(windows),
+                   target=getattr(args, "bucket_target", 8.0),
+                   min=getattr(args, "bucket_min", 1.0),
+                   max=getattr(args, "bucket_max", 10.0),
+                   silence_ms=getattr(args, "bucket_silence_ms", 700))
+    except NameError:
+        # cut_sentences() may be used directly (no args namespace). Ignore.
+        pass
  
     # Build punctuation graft context if requested
     graft_ready = False
@@ -1050,6 +1121,18 @@ def build_argparser():
                    help="Reject graft if normalized similarity to window text is below this.")
     p.add_argument("--graft_local_radius", type=int, default=80,
                    help="Locality radius (in words) around the mapped anchor for graft.")
+
+    # time-bucket controls (defaults: target=8s, min=1s, max=10s)
+    p.add_argument("--bucket_mode", action="store_true",
+                   help="Group adjacent windows to ~fixed length buckets.")
+    p.add_argument("--bucket_target", type=float, default=8.0,
+                   help="Target bucket duration in seconds.")
+    p.add_argument("--bucket_min", type=float, default=1.0,
+                   help="Minimum bucket duration in seconds.")
+    p.add_argument("--bucket_max", type=float, default=10.0,
+                   help="Maximum bucket duration in seconds.")
+    p.add_argument("--bucket_silence_ms", type=int, default=700,
+                   help="Prefer bucket boundaries with >= this much silence before them.")
 
     p.add_argument("--split_on_speaker_change", action="store_true", default=True,
                    help="Break sentences when speaker label changes (recommended).")

@@ -90,6 +90,24 @@ def segment_once(infile, outdir, base, boundaries, codec_copy=True, force_wav=Fa
     ext = Path(infile).suffix.lower()
     if force_wav: ext = ".wav"
 
+    seg_points = boundaries[1:-1]  # internal cut times only
+
+    if len(seg_points) == 0:
+        outpath = outdir / f"{base}_part_000{ext}"
+        cmd = ["ffmpeg","-hide_banner","-loglevel","error","-y","-i", str(infile), "-map","0:a:0"]
+        if codec_copy and not force_wav:
+            cmd += ["-c","copy"]
+        else:
+            if samplerate: cmd += ["-ar", str(samplerate)]
+            if channels:   cmd += ["-ac", str(channels)]
+            cmd += ["-c:a","pcm_s16le"]
+        cmd += [str(outpath)]
+        rc, out, err = run(cmd)
+        if rc != 0:
+            print("ffmpeg single-file write failed:", err, file=sys.stderr)
+            sys.exit(1)
+        return outpath
+
     outpat = outdir / f"{base}_part_%03d{ext}"
     seg_times = ",".join(f"{t:.3f}" for t in boundaries[1:-1])  # exclude 0 and total
 

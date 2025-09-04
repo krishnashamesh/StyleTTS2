@@ -74,6 +74,11 @@ def main():
                     help="seconds per chunk in buffered mode (default 30)")
     ap.add_argument("--chunk_step", type=float, default=25.0,
                     help="hop seconds between chunks in buffered mode (default 25)")
+    # overlap de-duplication knobs
+    ap.add_argument("--dedupe_min_run", type=int, default=6,
+                    help="Min identical-token run to consider as overlap when stitching buffered chunks.")
+    ap.add_argument("--dedupe_min_ratio", type=float, default=0.66,
+                    help="Min Jaccard ratio over the candidate run to accept overlap trimming.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -89,6 +94,34 @@ def main():
     # Load Parakeet v3 (multilingual TDT)
     asr = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v3")
     asr.eval()
+
+
+    # --------- helpers for stitching de-dup ---------
+    def _simple_tokenize(text: str):
+        # lower + keep letters/digits/' ; collapse whitespace
+        t = re.sub(r"[^\w'\s]", " ", text.lower())
+        return [tok for tok in re.split(r"\s+", t) if tok]
+
+    def _jaccard(a, b):
+        A, B = set(a), set(b)
+        return len(A & B) / max(1, len(A | B))
+
+    def _trim_overlap(prev_words, curr_words, min_run: int, min_ratio: float) -> int:
+        """
+        Return how many tokens to skip from the start of curr_words due to a
+        matching suffix(prefix) overlap with prev_words.
+        """
+        if not prev_words or not curr_words:
+            return 0
+        max_k = min(len(prev_words), len(curr_words))
+        for k in range(max_k, min_run - 1, -1):
+            suf = prev_words[-k:]
+            pre = curr_words[:k]
+            if suf == pre:
+                return k
+            if _jaccard(suf, pre) >= min_ratio:
+                return k
+        return 0
 
     def _iter_chunks(wav_path: Path, chunk_s: float, step_s: float, sr_expected: int = 16000):
         """Yield (start_sec, end_sec, tmp_wav_path) for overlapping windows."""
@@ -137,13 +170,24 @@ def main():
                 words.append({"start": float(s), "end": float(e), "word": token})
     else:
         pieces = []
+        prev_tokens = []
         # Force batch_size=1 in buffered mode to keep VRAM flat
         for (ts, te, tmp) in _iter_chunks(wav, args.chunk_len, args.chunk_step, sr_expected=16000):
             hyps = asr.transcribe(audio=[str(tmp)], batch_size=1, return_hypotheses=True)
             h = hyps[0][0] if isinstance(hyps[0], (list, tuple)) else hyps[0]
             t = getattr(h, "text", "") or (str(h) if not hasattr(h, "text") else "")
-            if t and t.strip():
-                pieces.append(t.strip())
+            t = t.strip()
+            if not t:
+                continue
+            toks = _simple_tokenize(t)
+            # trim any overlapped prefix against previous chunk's tail
+            skip = _trim_overlap(prev_tokens, toks, args.dedupe_min_run, args.dedupe_min_ratio)
+            if skip > 0:
+                toks = toks[skip:]
+                t = " ".join(toks)
+            if t:
+                pieces.append(t)
+                prev_tokens = (prev_tokens + toks)[-4096:]
         text = " ".join(pieces).strip()
         # word-level timestamps across overlapping chunks are non-trivial to dedupe;
         # we skip words_raw.json in buffered mode to avoid misleading timings.
