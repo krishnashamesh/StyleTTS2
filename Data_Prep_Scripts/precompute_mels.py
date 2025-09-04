@@ -18,9 +18,9 @@ Usage (custom config or paths):
     python precompute_mels.py --config path/to/config.yml
     python precompute_mels.py --root /data/wavs --train Data/train.txt --val Data/val.txt --out /opt/data/mel_cache
 
-    python precompute_mels.py --root /opt/apps/StyleTTS2/Data/VCTK/wav_norm \
-    --train /opt/apps/StyleTTS2/Data/VCTK/train_list.txt --val /opt/apps/StyleTTS2/Data/VCTK/val_list.txt \
-    --out /opt/apps/StyleTTS2/Data/VCTK/mel_cache
+python /opt/apps/StyleTTS2/Data_Prep_Scripts/precompute_mels.py --root /opt/apps/Training/Twin_Flames/cuts \
+    --train /opt/apps/Training/Twin_Flames/manifests_ipa/train_list.txt --val /opt/apps/Training/Twin_Flames/manifests_ipa/val_list.txt \
+    --out /opt/apps/Training/Twin_Flames/mel_cache
 
 
 """
@@ -105,8 +105,20 @@ def ensure_parent(p: Path):
 def process_split(root: str, rel_list: List[str], out_dir: str, to_mel, sr: int) -> Tuple[int, int]:
     done, skipped = 0, 0
     for rel in rel_list:
-        wav_path = Path(root) / rel
-        out_path = Path(out_dir) / Path(rel).with_suffix(".pt")
+        rootp = Path(root).resolve()
+        relp = Path(rel)
+        # Resolve absolute vs relative input path
+        if relp.is_absolute():
+            wav_path = relp
+            # Try to make a relative path under root for the cache layout
+            try:
+                rel_norm: Optional[Path] = wav_path.resolve().relative_to(rootp)
+            except Exception:
+                rel_norm = Path(wav_path.name)
+        else:
+            wav_path = rootp / relp
+            rel_norm = relp
+        out_path = Path(out_dir) / rel_norm.with_suffix(".pt")
         ensure_parent(out_path)
 
         if out_path.exists():
@@ -129,6 +141,7 @@ def main():
     ap.add_argument("--root", default=None)
     ap.add_argument("--train", default=None)
     ap.add_argument("--val", default=None)
+    ap.add_argument("--ood", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--sr", type=int, default=None)
     args = ap.parse_args()
@@ -175,13 +188,14 @@ def main():
 
     total_done = 0
     total_skipped = 0
-    for mani in [train, val]:
+    # Process splits in order: train, val, OOD (if provided)
+    for label, mani in [("train", train), ("val", val), ("ood", args.ood)]:
         if not mani:
             continue
         rels = read_manifest_list(mani)
-        print(f"[precompute] {mani}: {len(rels)} items")
+        print(f"[precompute] {label} ({mani}): {len(rels)} items")
         done, skipped = process_split(root, rels, out, to_mel, sr)
-        print(f"[precompute] {mani}: wrote {done}, skipped {skipped}")
+        print(f"[precompute] {label}: wrote {done}, skipped {skipped}")
         total_done += done
         total_skipped += skipped
 

@@ -67,7 +67,7 @@ RUN_DIR="${TRAIN_ROOT}/${RUN_NAME}"
 PREFIX="${RUN_NAME}"
 
 # Create folders
-mkdir -p "${RUN_DIR}"/{logs,chunks,chunked_output,manifests,proposals,cuts,asr_per_cut,manifests_ipa,nemo_out}
+mkdir -p "${RUN_DIR}"/{logs,chunks,chunked_output,manifests,proposals,cuts,asr_per_cut,manifests_ipa,nemo_out,mel_cache}
 LOG="${RUN_DIR}/logs/pipeline_$(date +%Y%m%d_%H%M%S).log"
 
 # Conda activation (robust)
@@ -224,6 +224,16 @@ run python "${SCRIPTS_ROOT}/phase5_text_polish_and_ipa.py" \
   --ipa --lang "${P5_LANG}" \
   --ood-frac 0.05 --train-frac-of-rest 0.95 --seed 42 --normalize \
   --index_json "${RUN_DIR}/asr_per_cut/index.json" --min_conf "${P5_MIN_CONF}"
+
+MEL_CACHE="${RUN_DIR}/mel_cache"
+
+run python "${SCRIPTS_ROOT}/precompute_mels.py" \
+  --root "${RUN_DIR}/cuts" \
+  --train "${RUN_DIR}/manifests_ipa/train_list.txt" \
+  --val "${RUN_DIR}/manifests_ipa/val_list.txt" \
+  --ood "${RUN_DIR}/manifests_ipa/OOD_texts.txt" \
+  --out "${MEL_CACHE}"
+
 conda deactivate
 
 echo ""
