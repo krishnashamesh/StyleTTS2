@@ -2,3 +2,4 @@ __pycache__
 Data/LJSpeech-*
 Data/VCTK*
 Data/Custom*
+output.log
