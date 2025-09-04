@@ -227,6 +227,106 @@ def bucket_segments(segs: List[Tuple[float,float]],
         out.pop()
     return out
 
+def _rms_envelope(x: np.ndarray, sr: int, win_ms: int, hop_ms: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (rms, times_sec) for the short-time RMS."""
+    win = int(sr * win_ms / 1000)
+    hop = int(sr * hop_ms / 1000)
+    rms = frame_rms(x, win, hop)
+    # center each frame at its midpoint
+    t = (np.arange(len(rms)) * hop + win / 2.0) / float(sr)
+    return rms, t
+
+def enforce_hard_cap(
+    segs: List[Tuple[float,float]], block: Block, audio: np.ndarray, sr: int, *,
+    hard_max_sec: float, bucket_target_sec: float, min_utt_sec: float,
+    micro_gap_ms: int, micro_thr_percentile: float, micro_win_ms: int, micro_hop_ms: int
+) -> List[Tuple[float,float]]:
+    """
+    Split any segment > hard_max_sec into smaller pieces.
+    Strategy:
+      - Aim for ~bucket_target_sec pieces.
+      - For each desired cut time, look +/- micro_gap_ms for the local RMS minimum.
+      - Respect min_utt_sec. If no good micro-dip, fall back to uniform splits.
+    """
+    if hard_max_sec is None or hard_max_sec <= 0:
+        return segs
+    out: List[Tuple[float,float]] = []
+    for (a, b) in segs:
+        dur = b - a
+        if dur <= hard_max_sec + 1e-6:
+            out.append((a, b))
+            continue
+        # Number of pieces: ceil(dur / hard_max_sec)
+        pieces = int(math.ceil(dur / float(hard_max_sec)))
+        pieces = max(2, pieces)
+        # Desired cut times (absolute) roughly evenly spaced
+        step = dur / pieces
+        desired = [a + step * k for k in range(1, pieces)]
+        # Prepare micro-RMS in the segment
+        s0 = max(0, int(round(a * sr)))
+        s1 = min(len(audio), int(round(b * sr)))
+        x = audio[s0:s1]
+        rms, t_rel = _rms_envelope(x, sr, micro_win_ms, micro_hop_ms)  # times relative to (a)
+        if rms.size:
+            thr = np.percentile(rms, max(1.0, min(99.0, micro_thr_percentile)))
+        cuts_abs: List[float] = []
+        for t_des in desired:
+            # Search +/- micro_gap around desired cut
+            w = micro_gap_ms / 1000.0
+            lo = max(0.0, (t_des - a) - w)
+            hi = min(t_rel[-1] if t_rel.size else (b - a), (t_des - a) + w)
+            if rms.size:
+                mask = (t_rel >= lo) & (t_rel <= hi)
+                if mask.any():
+                    # pick argmin RMS (prefer deep dips), else percentile threshold
+                    idxs = np.where(mask)[0]
+                    k = int(idxs[np.argmin(rms[idxs])])
+                    t_cut = a + float(t_rel[k])
+                else:
+                    t_cut = t_des
+            else:
+                t_cut = t_des
+            cuts_abs.append(t_cut)
+        # Validate cuts against min_utt_sec; adjust/skip if needed
+        cuts_abs = sorted([t for t in cuts_abs if a + min_utt_sec <= t <= b - min_utt_sec])
+        # If everything invalid, fall back to uniform safe splits
+        if not cuts_abs:
+            parts = []
+            start = a
+            while start + hard_max_sec < b - 1e-6:
+                t_cut = min(start + bucket_target_sec, b - min_utt_sec)
+                if t_cut - start < min_utt_sec:
+                    break
+                parts.append((start, t_cut))
+                start = t_cut
+            if b - start >= min_utt_sec:
+                parts.append((start, b))
+            else:
+                # if tail too short, merge back to previous
+                if parts:
+                    pa, pb = parts[-1]
+                    parts[-1] = (pa, b)
+                else:
+                    parts = [(a, b)]
+            out.extend(parts)
+            continue
+        # Build final pieces from valid cuts
+        last = a
+        for t_cut in cuts_abs:
+            if t_cut - last >= min_utt_sec:
+                out.append((last, t_cut))
+                last = t_cut
+        if b - last >= min_utt_sec:
+            out.append((last, b))
+        else:
+            # merge tail into previous if too short
+            if out:
+                pa, pb = out[-1]
+                out[-1] = (pa, b)
+            else:
+                out.append((a, b))
+    return out
+
 def apply_join_guards(
     seg: Tuple[float,float], block: Block,
     guard_ms: int, edge_window_ms: int, edge_scale: float
@@ -275,6 +375,16 @@ def main():
     ap.add_argument("--edge_guard_scale", type=float, default=0.5,
                     help="Scale join_guard when within edge window (e.g., 0.5 = half).")
 
+    # Hard cap (optional): split very long speaker-pure segments even if no long silence exists
+    ap.add_argument("--hard_max_sec", type=float, default=0.0,
+                    help="If >0, split any proposal longer than this (e.g., 12.0)")
+    ap.add_argument("--micro_gap_ms", type=int, default=120,
+                    help="± window around desired cut to search for a micro-silence")
+    ap.add_argument("--micro_thr_percentile", type=float, default=35.0,
+                    help="Percentile for micro RMS sensitivity (higher = more sensitive)")
+    ap.add_argument("--micro_win_ms", type=int, default=25)
+    ap.add_argument("--micro_hop_ms", type=int, default=10)
+
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     prop_dir = os.path.join(args.out_dir, "proposals")
@@ -304,6 +414,17 @@ def main():
         healed = heal_short_segments(raw_segs, args.min_utt_sec)
         # 3) bucket
         bucketed = bucket_segments(healed, args.bucket_min_sec, args.bucket_target_sec, args.bucket_max_sec)
+
+        bucketed = enforce_hard_cap(
+            bucketed, blk, audio, sr,
+            hard_max_sec=args.hard_max_sec,
+            bucket_target_sec=args.bucket_target_sec,
+            min_utt_sec=args.min_utt_sec,
+            micro_gap_ms=args.micro_gap_ms,
+            micro_thr_percentile=args.micro_thr_percentile,
+            micro_win_ms=args.micro_win_ms,
+            micro_hop_ms=args.micro_hop_ms
+        )
 
         # 4) guards + emit
         for intra_idx, (a, b) in enumerate(bucketed):
@@ -350,7 +471,12 @@ def main():
                 "bucket_max_sec": args.bucket_max_sec,
                 "join_guard_ms": args.join_guard_ms,
                 "edge_guard_window_ms": args.edge_guard_window_ms,
-                "edge_guard_scale": args.edge_guard_scale
+                "edge_guard_scale": args.edge_guard_scale,
+                "hard_max_sec": args.hard_max_sec,
+                "micro_gap_ms": args.micro_gap_ms,
+                "micro_thr_percentile": args.micro_thr_percentile,
+                "micro_win_ms": args.micro_win_ms,
+                "micro_hop_ms": args.micro_hop_ms
             },
             "count": len(proposals),
             "items": [asdict(p) for p in proposals]

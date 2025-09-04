@@ -120,6 +120,18 @@ def compute_confidence(text: str, x: np.ndarray, sr: int, dur_s: float,
         flags.append("short_clip")
     return float(round(conf, 3)), {"acoustic": round(acoustic,3), "wps": round(wps,3), "flags": flags}
 
+_PUNCT_RE = re.compile(r"[^\w\s']+", flags=re.UNICODE)
+def _normalize_for_empty(s: str) -> str:
+    """
+    Light normalization for gating: keep apostrophes, drop other punctuation,
+    collapse whitespace, lower-case.
+    """
+    if not s:
+        return ""
+    s2 = _PUNCT_RE.sub(" ", s).lower()
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
+
 
 def _normalize_words(raw) -> Optional[List[Dict[str, Any]]]:
     if not raw:
@@ -290,6 +302,15 @@ def main():
     ap.add_argument("--short_penalty", type=float, default=0.7)
     ap.add_argument("--rms_thr_percentile", type=float, default=20.0)
     ap.add_argument("--train_list_path", default="", help="Optional path to write train_list.txt")
+    ap.add_argument("--min_conf", type=float, default=0.45,
+                    help="Drop rows with conf < min_conf when writing train_list.txt")
+    ap.add_argument("--min_chars", type=int, default=8,
+                    help="Require at least this many non-space characters after light normalization")
+    ap.add_argument("--min_words", type=int, default=3,
+                    help="Require at least this many whitespace-separated tokens after normalization")
+    ap.add_argument("--drop_punct_only", action="store_true", default=True,
+                    help="If normalized text is punctuation-only/empty, drop it")
+
     args = ap.parse_args()
 
     cuts_dir = Path(args.cuts_dir)
@@ -377,10 +398,33 @@ def main():
     tlp = args.train_list_path.strip()
     if tlp:
         outp = Path(tlp); ensure_dir(outp.parent)
+        wrote, dropped = 0, 0
         with open(outp, "w", encoding="utf-8") as f:
             for r in results:
-                if r.get("ok"):
-                    f.write(f"{r['wav']}|{r['text']}|{r['spk']}\n")
+                if not r.get("ok"):
+                    continue
+                text = (r.get("text") or "").strip()
+                conf = float(r.get("conf", 0.0))
+                flags = set(r.get("details", {}).get("flags", []))
+                # Hard drops
+                if "empty_text" in flags:
+                    dropped += 1
+                    continue
+                if conf < args.min_conf:
+                    dropped += 1
+                    continue
+                # Light normalization for emptiness / length checks
+                norm = _normalize_for_empty(text)
+                char_count = len(norm.replace(" ", ""))
+                word_count = len([t for t in norm.split() if t])
+                if args.drop_punct_only and char_count == 0:
+                    dropped += 1
+                    continue
+                if char_count < args.min_chars or word_count < args.min_words:
+                    dropped += 1
+                    continue
+                f.write(f"{r['wav']}|{text}|{r['spk']}\n")
+                wrote += 1
 
     # Summary
     oks = [r for r in results if r.get("ok")]
@@ -393,6 +437,8 @@ def main():
     print(f"[Phase4] wrote: {out_dir/'index.json'}  {qc_path}")
     if tlp:
         print(f"[Phase4] train_list: {tlp}")
+        print(f"[Phase4] emitted={wrote}  dropped_by_gates={dropped}  (min_conf={args.min_conf}, "
+              f"min_chars={args.min_chars}, min_words={args.min_words}, drop_punct_only={args.drop_punct_only})")
 
 if __name__ == "__main__":
     main()

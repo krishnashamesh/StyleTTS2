@@ -63,7 +63,7 @@ def infer_defaults_from_cfg(cfg: dict) -> Tuple[str, str, str, str, int]:
     root = dp.get("root_path", "Data")
     train = dp.get("train_data", "Data/train_list.txt")
     val = dp.get("val_data", "Data/val_list.txt")
-    out = dp.get("mel_cache_dir", "/opt/data/mel_cache")  # NEW: add to your config
+    out = dp.get("mel_cache_dir", "/opt/data/mel_cache")
     sr  = pp.get("sr", SR_DEFAULT)
     return root, train, val, out, int(sr)
 
