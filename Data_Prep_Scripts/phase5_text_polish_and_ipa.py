@@ -52,6 +52,12 @@ import argparse, json, os, re, random, sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import List, Tuple, Optional, Dict
+import contextlib
+
+try:
+    import fcntl  # for simple file locking on Linux
+except Exception:  # pragma: no cover
+    fcntl = None
 
 # --------------------------- Utils ---------------------------
 
@@ -189,6 +195,11 @@ def main():
     # Path rewriting
     ap.add_argument("--make-relative-to", type=Path, default=None,
                     help="If set, rewrite wav paths relative to this root (posix style)")
+    # Global speaker ID offset support
+    ap.add_argument("--counter_file", type=Path, default=None,
+                    help="Path to a global counter file (txt int). If set, all speaker IDs are offset by this value.")
+    ap.add_argument("--update_counter", action="store_true",
+                    help="If set with --counter_file, advance the counter by the number of unique speakers in this run.")
 
     args = ap.parse_args()
 
@@ -234,6 +245,8 @@ def main():
     # Prepare final items (wav, text_or_ipa, spk_id)
     final: List[Tuple[str, str, int]] = []
     phoneme_fail = 0
+    # Track a label per local speaker id (works for numeric and non-numeric)
+    label_by_local: Dict[int, str] = {}
 
     for it in items_raw:
         # Optional conf filtering
@@ -252,6 +265,9 @@ def main():
                 # We treat exact equality as potential failure if phonemizer is active
                 phoneme_fail += 1
         spk_id = to_spk_id(it.spk_label)
+        # Remember the original label for this local id (first one wins)
+        if spk_id not in label_by_local:
+            label_by_local[spk_id] = it.spk_label
 
         wav_path_out = it.wav
         if args.make_relative_to is not None:
@@ -265,6 +281,57 @@ def main():
     if not final:
         print("[ERROR] No rows survived filtering/processing.", file=sys.stderr)
         sys.exit(2)
+
+    # ----- Apply optional global offset to speaker IDs -----
+    offset_applied = 0
+    counter_before = None
+    counter_after = None
+    if args.counter_file:
+        # read integer (create file with 0 if missing)
+        args.counter_file.parent.mkdir(parents=True, exist_ok=True)
+        if not args.counter_file.exists():
+            args.counter_file.write_text("0\n", encoding="utf-8")
+        # lock and read
+        def _locked_read_int(p: Path) -> int:
+            with open(p, "r+", encoding="utf-8") as fh:
+                if fcntl:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(fh)
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                        txt = fh.read().strip()
+                        return int(txt or "0")
+                else:
+                    txt = fh.read().strip()
+                    return int(txt or "0")
+        def _locked_write_int(p: Path, val: int):
+            with open(p, "w", encoding="utf-8") as fh:
+                if fcntl:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                fh.write(f"{int(val)}\n")
+                if fcntl:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+        counter_before = _locked_read_int(args.counter_file)
+        offset_applied = int(counter_before)
+
+        # Build local->global map from the actual local IDs present in `final`
+        local_ids = sorted(set(sid for _, _, sid in final))
+        _local_to_global = {sid: sid + offset_applied for sid in local_ids}
+        # Rewrite finals with global IDs
+        final = [(p, t, _local_to_global[sid]) for (p, t, sid) in final]
+        # Build spk2id_global using the remembered labels for each local id
+        spk2id_global: Dict[str, int] = {}
+        for sid in local_ids:
+            lbl = label_by_local.get(sid, str(sid))
+            spk2id_global[lbl] = sid + offset_applied
+        spk2id = spk2id_global
+        # Advance the counter by the number of unique speakers we actually used
+        if args.update_counter:
+            counter_after = offset_applied + len(local_ids)
+            _locked_write_int(args.counter_file, counter_after)
+        else:
+            counter_after = counter_before
+
 
     random.shuffle(final)
 
@@ -294,6 +361,9 @@ def main():
         "phoneme_fail_est": phoneme_fail if args.ipa else 0,
         "used_index_json": bool(ok_by_utt),
         "min_conf": args.min_conf if ok_by_utt else None,
+        "offset_applied": int(offset_applied),
+        "counter_before": int(counter_before) if counter_before is not None else None,
+        "counter_after": int(counter_after) if counter_after is not None else None,
     }
     (args.out_dir / 'stats.json').write_text(json.dumps(stats, indent=2), encoding='utf-8')
 

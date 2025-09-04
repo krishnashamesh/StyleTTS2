@@ -14,6 +14,7 @@ BANDIT_CKPT="/opt/apps/bandit/workspace/dnr-3s-mus64-l1snr-plus.ckpt"
 NEMO_REPO="/opt/apps/NeMo"
 ASR_MODEL="nvidia/parakeet-tdt-0.6b-v3"
 
+COUNTER_FILE="/opt/apps/Training/spk_counter.txt"
 MAX_SPKS=2
 
 # Phase-2 knobs (you gave these)
@@ -218,12 +219,14 @@ conda deactivate
 
 ### Phase 5 — text polish + IPA (with index gating)
 conda_activate styletts2
+if [[ ! -f "${COUNTER_FILE}" ]]; then echo "0" > "${COUNTER_FILE}"; fi
 run python "${SCRIPTS_ROOT}/phase5_text_polish_and_ipa.py" \
   --in_manifest "${RUN_DIR}/manifests/train_list.txt" \
   --out_dir "${RUN_DIR}/manifests_ipa" \
   --ipa --lang "${P5_LANG}" \
   --ood-frac 0.05 --train-frac-of-rest 0.95 --seed 42 --normalize \
-  --index_json "${RUN_DIR}/asr_per_cut/index.json" --min_conf "${P5_MIN_CONF}"
+  --index_json "${RUN_DIR}/asr_per_cut/index.json" --min_conf "${P5_MIN_CONF}" \
+  --counter_file "${COUNTER_FILE}" --update_counter
 
 MEL_CACHE="${RUN_DIR}/mel_cache"
 
