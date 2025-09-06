@@ -1672,7 +1672,7 @@ def main(config_path):
                 except Exception:
                     pass
 
-        if epoch % saving_epoch == 0 or epoch == epochs:
+        if epoch % saving_epoch == 0 or ((epoch + 1) == epochs):
             cur = (loss_test / iters_test)
             if cur < best_loss:
                 best_loss = cur
@@ -1697,6 +1697,14 @@ def main(config_path):
                 
                 with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
                     yaml.dump(config, outfile, default_flow_style=True)
+
+            if ((epoch + 1) == epochs):
+                log_print('Saving Second Stage..', logger)
+                final_save_path = osp.join(log_dir, config.get('second_stage_path', 'second_stage.pth'))
+                torch.save(state, final_save_path)
+                shutil.copy(osp.join(log_dir, osp.basename(config_path)),osp.dirname(log_dir))
+
+                logger.info(f"[ckpt] Second Stage saved: {final_save_path}")
 
             gc.collect(); 
             if torch.cuda.is_available(): 

@@ -1,5 +1,6 @@
-log_dir: "Models/Custom_Data/English_Speech"
+log_dir: "Models/Custom_Data/English_Love_Story"
 first_stage_path: "../first_stage.pth"
+second_stage_path: "../second_stage.pth"
 save_freq: 1
 log_interval: 10
 device: "cuda"
@@ -36,11 +37,11 @@ precision:
   tf32: false                # allow TF32 for matmuls when in fp32 mode
 
 data_params:
-  train_data: "/opt/apps/Training/English_Speech/manifests_ipa/train_list.txt"
-  val_data: "/opt/apps/Training/English_Speech/manifests_ipa/val_list.txt"
-  root_path: "/opt/apps/Training/English_Speech/cuts"
-  OOD_data: "/opt/apps/Training/English_Speech/manifests_ipa/OOD_texts.txt"
-  mel_cache_dir: "/opt/apps/Training/English_Speech/mel_cache"
+  train_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/train_list.txt"
+  val_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/val_list.txt"
+  root_path: "/opt/apps/Training/English_Love_Story/cuts"
+  OOD_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/OOD_texts.txt"
+  mel_cache_dir: "/opt/apps/Training/English_Love_Story/mel_cache"
   min_length: 10 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:

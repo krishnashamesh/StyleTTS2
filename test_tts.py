@@ -159,7 +159,7 @@ if MULTISPEAKER:
 else:
     print("[ms] Single-speaker mode (no reference features required).")
 
-params_whole = torch.load("Models/Custom_Data/epoch_2nd_00004.pth")
+params_whole = torch.load("Models/Custom_Data/second_stage.pth")
 params = params_whole['net']
 
 for key in model:
