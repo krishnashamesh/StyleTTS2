@@ -15,7 +15,7 @@ NEMO_REPO="/opt/apps/NeMo"
 ASR_MODEL="nvidia/parakeet-tdt-0.6b-v3"
 
 COUNTER_FILE="/opt/apps/Training/spk_counter.txt"
-MAX_SPKS=2
+MAX_SPKS=8
 
 # Phase-2 knobs (you gave these)
 MIN_SIL=1.3
@@ -137,7 +137,6 @@ LISTFILE="${RUN_DIR}/concat_list.txt"
 shopt -s nullglob
 matches=(
   ${RUN_DIR}/chunked_output/dnr-3s-mus64-l1snr-plus/chunks/${TRACK_BASE}_part_*_*/speech.wav
-  ${RUN_DIR}/chunked_output/dnr-3s-mus64-l1snr-plus/chunks/${TRACK_BASE}_part_*/speech.wav
 )
 shopt -u nullglob
 

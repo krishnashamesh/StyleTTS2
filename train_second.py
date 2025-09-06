@@ -1,12 +1,15 @@
 # load packages
 
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+#os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:32")
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
 
 import random
 import yaml
 import time
+import hashlib
+import json
 from munch import Munch
 import numpy as np
 import torch
@@ -232,7 +235,7 @@ def main(config_path):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
 
     # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+    file_handler = logging.FileHandler(osp.join(log_dir, 'train_second.log'))
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
@@ -296,6 +299,41 @@ def main(config_path):
         gc.collect()
         _log_free("init")
 
+    # -------------------------
+    # Dataset/config signature
+    # -------------------------
+    def _hash_lines(lines):
+        try:
+            norm = [str(x).strip() for x in lines]
+            return hashlib.sha1("\n".join(sorted(norm)).encode("utf-8")).hexdigest()
+        except Exception:
+            return "NA"
+    def _hash_file(path):
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha1(f.read()).hexdigest()
+        except Exception:
+            return "NA"
+
+    manifest_hash = _hash_lines(train_list + val_list)
+    config_hash   = _hash_file(config_path)
+    spk_ids_train = sorted(tr_cnt.keys())
+    stage2_sig = {
+        "stage": 2,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "manifest_hash": manifest_hash,
+        "config_hash":   config_hash,
+        "train_items": len(train_list),
+        "val_items":   len(val_list),
+        "speakers": {
+            "count": int(len(spk_ids_train)),
+            "min":   int(min(spk_ids_train) if spk_ids_train else 0),
+            "max":   int(max(spk_ids_train) if spk_ids_train else 0),
+        },
+        "parent_manifest_hash": None,
+    }
+
+
     # Use CPU as much as possible
     mel_cache_dir = (data_params or {}).get("mel_cache_dir")
     ds_cfg = {"mel_cache_dir": mel_cache_dir} if mel_cache_dir else {}
@@ -327,6 +365,7 @@ def main(config_path):
     )
     
     logger.info(f"[data] dataloaders ready in {time.time()-t0:.1f}s (workers={nw})")
+    ref_feat = None
 
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
@@ -435,11 +474,27 @@ def main(config_path):
     iters = 0
 
     load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
+    log_print('load_pretrained %s ...' % load_pretrained, logger)
     
     if not load_pretrained:
         if config.get('first_stage_path', '') != '':
             first_stage_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
             log_print('Loading the first stage model at %s ...' % first_stage_path, logger)
+
+            # Try to read parent signature for provenance
+            try:
+                _parent = torch.load(first_stage_path, map_location='cpu')
+                _psig = _parent.get('signature', None)
+                if _psig:
+                    stage2_sig["parent_manifest_hash"] = _psig.get("manifest_hash")
+                    logger.info(f"[sig] parent manifest_hash={stage2_sig['parent_manifest_hash']}")
+                    _pspk = _psig.get("speakers", {})
+                    logger.info(f"[sig] parent speakers: count={_pspk.get('count','?')} range=[{_pspk.get('min','?')},{_pspk.get('max','?')}]")
+                else:
+                    logger.info("[sig] parent signature not present in first-stage checkpoint")
+            except Exception as e:
+                logger.info(f"[sig] failed to read parent signature: {e}")
+
             model, _, start_epoch, iters = load_checkpoint(model, 
                 None, 
                 first_stage_path,
@@ -488,6 +543,17 @@ def main(config_path):
     
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                 scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+
+    # Write run signature once
+    try:
+        with open(osp.join(log_dir, "run_signature.json"), "w") as f:
+            json.dump(stage2_sig, f, indent=2)
+        logger.info(f"[sig] wrote run_signature.json (manifest_hash={manifest_hash[:8]}… parent={str(stage2_sig['parent_manifest_hash'])[:8]}…)")
+        if stage2_sig["parent_manifest_hash"] and stage2_sig["parent_manifest_hash"] != manifest_hash:
+            logger.info("[sig] NOTE: Stage-2 dataset differs from Stage-1 (hash mismatch)")
+    except Exception as e:
+        logger.info(f"[sig] failed to write run_signature.json: {e}")
+
 
     # Log LR table at epoch 0
     try:
@@ -721,7 +787,7 @@ def main(config_path):
                     if multispeaker:
                         ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
                         ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                        ref = torch.cat([ref_ss, ref_sp], dim=1)
+                        ref_feat = torch.cat([ref_ss, ref_sp], dim=1)
 
                 # compute the style of the entire utterance (no grads needed; s_trg is detached)
                 # doing this under no_grad trims graph/VRAM with zero training signal change
@@ -761,11 +827,11 @@ def main(config_path):
                         s_preds = train_sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
                             embedding=bert_dur,
                             embedding_scale=1,
-                                    features=ref, # reference from the same speaker as the embedding
+                                    features=ref_feat, # reference from the same speaker as the embedding
                                 embedding_mask_proba=0.1,
                                 num_steps=num_steps).squeeze(1)
                         _edm = _get_diffusion_core(model)
-                        loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
+                        loss_diff = _edm(s_trg.unsqueeze(1), embedding=bert_dur, features=ref_feat).mean() # EDM loss
                         loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
                         del s_preds
                     else:
@@ -1121,7 +1187,7 @@ def main(config_path):
                         ref_lengths,
                         use_ind,
                         s_trg.detach(),
-                        ref if multispeaker else None
+                        ref_feat if multispeaker else None
                     )
 
                     if slm_out is None:
@@ -1309,7 +1375,6 @@ def main(config_path):
                     waves = batch[0]
                     batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
-                    ref = None
                     with torch.no_grad():
                         mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                         
@@ -1539,26 +1604,31 @@ def main(config_path):
                 )
 
                 # compute reference styles
+                ref_feat = None
                 if multispeaker and epoch >= diff_epoch:
                     ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
                     ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref = torch.cat([ref_ss, ref_sp], dim=1)
+                    ref_feat = torch.cat([ref_ss, ref_sp], dim=1)
                     
                 for bib in range(len(d_en)):
-                    if multispeaker:
-                        s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                features=ref[bib].unsqueeze(0), # reference from the same speaker as the embedding
-                                 num_steps=5).squeeze(1)
+                    if multispeaker and ref_feat is not None:
+                        s_pred = val_sampler(
+                            noise=torch.randn((1, 256)).unsqueeze(1).to(texts.device),
+                            embedding=bert_dur[bib].unsqueeze(0),
+                            embedding_scale=1,
+                            features=ref_feat[bib].unsqueeze(0),  # reference from same speaker
+                            num_steps=5
+                        ).squeeze(1)
                     else:
-                        s_pred = val_sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                 num_steps=5).squeeze(1)
+                        s_pred = val_sampler(
+                            noise=torch.randn((1, 256)).unsqueeze(1).to(texts.device),
+                            embedding=bert_dur[bib].unsqueeze(0),
+                            embedding_scale=1,
+                            num_steps=5
+                        ).squeeze(1)
 
                     s = s_pred[:, 128:]
-                    ref = s_pred[:, :128]
+                    s_ref = s_pred[:, :128] 
 
                     d = model.predictor.text_encoder(d_en[bib, :, :input_lengths[bib]].unsqueeze(0), 
                                                      s, input_lengths[bib, ...].unsqueeze(0), text_mask[bib, :input_lengths[bib]].unsqueeze(0))
@@ -1580,8 +1650,10 @@ def main(config_path):
                     # encode prosody
                     en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(texts.device))
                     F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-                    out = model.decoder((t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)), 
-                                            F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+                    out = model.decoder(
+                        (t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)),
+                        F0_pred, N_pred, s_ref.squeeze().unsqueeze(0)
+                    )
 
                     # free per-preview temps
                     try:
@@ -1614,6 +1686,7 @@ def main(config_path):
                 'val_loss': loss_test / iters_test,
                 'epoch': epoch,
             }
+            state['signature'] = {**stage2_sig, "epoch": epoch + 1, "iters": iters}
             save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
             torch.save(state, save_path)
             logger.info(f"[ckpt] saved: {save_path}")
@@ -1660,7 +1733,7 @@ def trace_shapes(model, logger=None):
 # ------------------------------------------------------------------
 def _redirect_io(log_dir):
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'train_stdout.log')
+    log_path = os.path.join(log_dir, 'train_stdout_second.log')
     log_file = open(log_path, 'a', buffering=262144)  # ~256 KiB buffered
     sys.stdout = log_file
     sys.stderr = log_file

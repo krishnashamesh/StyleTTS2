@@ -171,7 +171,10 @@ class FilePathDataset(torch.utils.data.Dataset):
         ps = ""
         
         while len(ps) < self.min_length:
-            rand_idx = np.random.randint(0, len(self.ptexts) - 1)
+            if len(self.ptexts) > 1:
+                rand_idx = np.random.randint(0, len(self.ptexts) - 1)
+            else:
+                rand_idx = 0    
             ps = self.ptexts[rand_idx]
             
             text = self.text_cleaner(ps)

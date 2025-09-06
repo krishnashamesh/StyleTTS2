@@ -53,6 +53,7 @@ import atexit, faulthandler, signal, sys, os, time, threading, subprocess, loggi
 import gc
 import json
 from collections import Counter
+import hashlib
 
 from accelerate.logging import get_logger
 logger = get_logger(__name__, log_level="INFO")
@@ -68,7 +69,7 @@ def main(config_path):
     os.makedirs(log_dir, exist_ok=True)
 
     # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+    file_handler = logging.FileHandler(osp.join(log_dir, 'train_first.log'))
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.logger.addHandler(file_handler)
@@ -203,6 +204,62 @@ def main(config_path):
         va_cnt, va_bad = _summarize_speakers(val_list)
         log_print(f"[spk] train unique={len(tr_cnt)} bad_defaulted={tr_bad} top={tr_cnt.most_common(5)}", logger)
         log_print(f"[spk]  val  unique={len(va_cnt)} bad_defaulted={va_bad} top={va_cnt.most_common(5)}", logger)
+
+
+    # -------------------------
+    # Dataset/config signature
+    # -------------------------
+    def _hash_lines(lines):
+        try:
+            norm = [str(x).strip() for x in lines]
+            return hashlib.sha1("\n".join(sorted(norm)).encode("utf-8")).hexdigest()
+        except Exception:
+            return "NA"
+    def _hash_file(path):
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha1(f.read()).hexdigest()
+        except Exception:
+            return "NA"
+
+    manifest_hash = _hash_lines(train_list + val_list)
+    config_hash   = _hash_file(config_path)
+    spk_ids_train = sorted(tr_cnt.keys()) if 'tr_cnt' in locals() else []
+    sig = {
+        "stage": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "manifest_hash": manifest_hash,
+        "config_hash":   config_hash,
+        "train_items": len(train_list),
+        "val_items":   len(val_list),
+        "speakers": {
+            "count": int(len(spk_ids_train)),
+            "min":   int(min(spk_ids_train) if spk_ids_train else 0),
+            "max":   int(max(spk_ids_train) if spk_ids_train else 0),
+        },
+    }
+    if accelerator.is_main_process:
+        try:
+            with open(osp.join(log_dir, "run_signature.json"), "w") as f:
+                json.dump(sig, f, indent=2)
+            log_print(f"[sig] wrote run_signature.json (manifest_hash={manifest_hash[:8]}…)", logger)
+        except Exception as e:
+            log_print(f"[sig] failed to write run_signature.json: {e}", logger)
+
+    # If resuming from a checkpoint, surface signature drift early
+    resume_meta = None
+    if config.get('pretrained_model', ''):
+        try:
+            _cp = torch.load(config['pretrained_model'], map_location='cpu')
+            resume_meta = _cp.get('signature', None)
+        except Exception as e:
+            if accelerator.is_main_process:
+                log_print(f"[sig] resume signature not available: {e}", logger)
+    if resume_meta and accelerator.is_main_process:
+        if resume_meta.get("manifest_hash") != manifest_hash:
+            log_print(f"[sig] WARNING: manifest hash changed "
+                      f"(ckpt={resume_meta.get('manifest_hash','NA')[:8]}… "
+                      f"→ now={manifest_hash[:8]}…)", logger)
 
     #Performance improvement
     nw = min(32, os.cpu_count() or 8)
@@ -357,13 +414,47 @@ def main(config_path):
             for pg, blr in zip(opt.param_groups, blrs):
                 pg["lr"] = float(blr) * float(scale)
     
+    # --------- Resume policy: resume | finetune | fresh ----------
+    resume_mode = str(config.get('resume_mode', 'finetune')).lower().strip()
     with accelerator.main_process_first():
-        if config.get('pretrained_model', '') != '':
-            model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
-                                        load_only_params=config.get('load_only_params', True))
+        if config.get('pretrained_model', ''):
+            if resume_mode == 'resume':
+                # Full resume: load weights + optimizer + counters
+                model, optimizer, start_epoch, iters = load_checkpoint(
+                    model, optimizer, config['pretrained_model'], load_only_params=False
+                )
+                if accelerator.is_main_process:
+                    log_print(f"[resume] mode=resume → start_epoch={start_epoch} iters={iters}", logger)
+            elif resume_mode == 'finetune':
+                # Finetune: weights only, reset counters, keep fresh optimizer/schedulers
+                model, _, _, _ = load_checkpoint(
+                    model, optimizer, config['pretrained_model'], load_only_params=True
+                )
+                start_epoch = 0
+                iters = 0
+                if accelerator.is_main_process:
+                    log_print(f"[resume] mode=finetune → counters reset (start_epoch=0, iters=0)", logger)
+            elif resume_mode == 'fresh':
+                # Ignore checkpoint entirely
+                start_epoch = 0
+                iters = 0
+                if accelerator.is_main_process:
+                    log_print(f"[resume] mode=fresh → ignoring pretrained_model; starting from scratch", logger)
+            else:
+                # Back-compat with old flag (load_only_params) if someone passes a weird value
+                lop = bool(config.get('load_only_params', True))
+                model, optimizer, start_epoch, iters = load_checkpoint(
+                    model, optimizer, config['pretrained_model'], load_only_params=lop
+                )
+                if lop:
+                    start_epoch = 0; iters = 0
+                if accelerator.is_main_process:
+                    log_print(f"[resume] mode={resume_mode} (legacy fallback, load_only_params={lop}) "
+                              f"→ start_epoch={start_epoch} iters={iters}", logger)
         else:
             start_epoch = 0
             iters = 0
+            log_print("[resume] mode={} (legacy fallback)", logger)
     
     # in case not distributed
     try:
@@ -1116,6 +1207,7 @@ def main(config_path):
                     'val_loss': val_avg,
                     'epoch': epoch,
                 }
+                state['signature'] = {**sig, "epoch": epoch + 1, "iters": iters}
                 save_path = osp.join(log_dir, 'epoch_1st_%05d.pth' % epoch)
                 torch.save(state, save_path)
                 gc.collect()
@@ -1148,6 +1240,7 @@ def main(config_path):
             'val_loss': last_val_avg,
             'epoch': epoch,
         }
+        state['signature'] = {**sig, "epoch": epoch + 1, "iters": iters}
         save_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
         torch.save(state, save_path)
 
@@ -1160,7 +1253,7 @@ def main(config_path):
 # ------------------------------------------------------------------
 def _redirect_io(log_dir):
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'train_stdout.log')
+    log_path = os.path.join(log_dir, 'train_stdout_first.log')
     log_file = open(log_path, 'a', buffering=262144)  # line-buffered
     sys.stdout = log_file
     sys.stderr = log_file
