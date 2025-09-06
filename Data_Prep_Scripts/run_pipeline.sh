@@ -187,6 +187,7 @@ run python "${SCRIPTS_ROOT}/phase2_utterance_proposals.py" \
   --blocks_rttm "${RUN_DIR}/nemo_out/pred_rttms/blocks.cleaned.rttm" \
   --blocks_json "${RUN_DIR}/nemo_out/pred_rttms/blocks.cleaned.json" \
   --out_dir "${RUN_DIR}" \
+  --prefix "${PREFIX}" \
   --min_silence_sec "${MIN_SIL}" \
   --silence_thr_method "${SIL_THR_METHOD}" --silence_thr_value "${SIL_THR_VALUE}" \
   --min_utt_sec "${MIN_UTT}" \

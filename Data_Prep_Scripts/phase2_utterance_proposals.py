@@ -355,6 +355,7 @@ def main():
     ap.add_argument("--blocks_rttm", required=True, help="Phase-1 cleaned RTTM (blocks.cleaned.rttm)")
     ap.add_argument("--blocks_json", default="", help="Optional Phase-1 JSON (blocks.cleaned.json) for purity")
     ap.add_argument("--out_dir", required=True, help="Directory to write proposals/*")
+    ap.add_argument("--prefix", default="", help="Optional prefix (e.g., video name). Whitespaces will be replaced with '_' and prepended to every utt_id.")
 
     # Silence detection knobs
     ap.add_argument("--min_silence_sec", type=float, default=0.9)
@@ -389,6 +390,11 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     prop_dir = os.path.join(args.out_dir, "proposals")
     os.makedirs(prop_dir, exist_ok=True)
+
+    # sanitize prefix: collapse any whitespace runs to single underscore
+    def _sanitize_ws(s: str) -> str:
+        return "_".join(s.split()) if s else ""
+    prefix = _sanitize_ws(args.prefix)
 
     # Load audio
     audio, sr = sf.read(args.audio24k, dtype="float32", always_2d=False)
@@ -437,7 +443,8 @@ def main():
             s0 = int(round(ag * sr))
             s1 = int(round(bg * sr))
             dur = bg - ag
-            utt_id = f"utt_{blk.dia_idx:06d}_{intra_idx:02d}_spk{blk.speaker.replace('spk', '').replace('speaker','').strip() or blk.speaker}"
+            base_utt = f"utt_{blk.dia_idx:06d}_{intra_idx:02d}_spk{blk.speaker.replace('spk', '').replace('speaker','').strip() or blk.speaker}"
+            utt_id = f"{prefix}_{base_utt}" if prefix else base_utt
             proposals.append(Utterance(
                 utt_id=utt_id,
                 dia_idx=blk.dia_idx,
@@ -462,6 +469,7 @@ def main():
             "audio": args.audio24k,
             "sr": sr,
             "params": {
+                "prefix": prefix,
                 "min_silence_sec": args.min_silence_sec,
                 "silence_thr_method": args.silence_thr_method,
                 "silence_thr_value": args.silence_thr_value,

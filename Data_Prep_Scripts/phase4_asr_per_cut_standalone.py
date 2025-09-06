@@ -48,7 +48,7 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def list_wavs(cuts_dir: Path) -> List[Path]:
-    return sorted(cuts_dir.glob("utt_*.wav"))
+    return sorted(cuts_dir.glob("*utt_*.wav"))
 
 def infer_spk_from_name(path: Path) -> str:
     m = re.search(r"_spk[_\-]?(\d+)\.wav$", path.name)
