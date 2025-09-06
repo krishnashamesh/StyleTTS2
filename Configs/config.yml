@@ -1,4 +1,4 @@
-log_dir: "Models/Custom_Data/English_Love_Story"
+log_dir: "Models/Custom_Data/Sep_merged"
 first_stage_path: "../first_stage.pth"
 second_stage_path: "../second_stage.pth"
 save_freq: 1
@@ -17,9 +17,9 @@ ga_grow_patience: 3
 ga_grow_cooldown: 5
 fm_max_chunks: 64
 max_len: 1000 # maximum number of frames (10 seconds), 1000 = 12.5 s For second stage due to lack of memory forced to use 400, want 1000
-#pretrained_model: ""  # for First stage
-pretrained_model: "Models/Custom_Data/first_stage.pth"
-resume_mode: finetune  # resume → resume everything (model+optimizer+epoch/iters) || finetune (default) → load weights only, reset epoch/iters (fresh schedule) || fresh → ignore checkpoint entirely (start from scratch)
+pretrained_model: ""  # for First stage
+#pretrained_model: "Models/Custom_Data/first_stage.pth"
+resume_mode: fresh  # resume → resume everything (model+optimizer+epoch/iters) || finetune (default) → load weights only, reset epoch/iters (fresh schedule) || fresh → ignore checkpoint entirely (start from scratch)
 second_stage_load_pretrained: false # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
 decoder_channels_last: true
@@ -37,11 +37,11 @@ precision:
   tf32: false                # allow TF32 for matmuls when in fp32 mode
 
 data_params:
-  train_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/train_list.txt"
-  val_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/val_list.txt"
-  root_path: "/opt/apps/Training/English_Love_Story/cuts"
-  OOD_data: "/opt/apps/Training/English_Love_Story/manifests_ipa/OOD_texts.txt"
-  mel_cache_dir: "/opt/apps/Training/English_Love_Story/mel_cache"
+  train_data: "/opt/apps/Training/Sep_merged/manifests_ipa/train_list.txt"
+  val_data: "/opt/apps/Training/Sep_merged/manifests_ipa/val_list.txt"
+  root_path: "/opt/apps/Training/Sep_merged/cuts"
+  OOD_data: "/opt/apps/Training/Sep_merged/manifests_ipa/OOD_texts.txt"
+  mel_cache_dir: "/opt/apps/Training/Sep_merged/mel_cache"
   min_length: 10 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:
