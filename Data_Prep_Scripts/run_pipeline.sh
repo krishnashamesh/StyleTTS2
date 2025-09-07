@@ -42,6 +42,8 @@ P5_MIN_CONF=0.40
 P5_LANG="en-us"
 ### -------------------------------
 
+SKIP_LOG="${TRAIN_ROOT}/skipped_runs.log"
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 \"Video Name.ext\"" >&2
   exit 2
@@ -66,6 +68,14 @@ BASENAME="$(basename "$VIDEO_PATH")"
 RUN_NAME="$(printf "%s" "${BASENAME%.*}" | tr ' ' '_' | tr -s '_' | sed 's/[^A-Za-z0-9_]/_/g')"
 RUN_DIR="${TRAIN_ROOT}/${RUN_NAME}"
 PREFIX="${RUN_NAME}"
+
+# If the run directory already exists, skip this job and log it
+if [[ -d "${RUN_DIR}" ]]; then
+  TS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  MSG="[SKIP] ${TS} Run dir already exists: ${RUN_DIR} (video=${VIDEO_PATH})"
+  echo "$MSG" | tee -a "${SKIP_LOG}"
+  exit 0
+fi
 
 # Create folders
 mkdir -p "${RUN_DIR}"/{logs,chunks,chunked_output,manifests,proposals,cuts,asr_per_cut,manifests_ipa,nemo_out,mel_cache}

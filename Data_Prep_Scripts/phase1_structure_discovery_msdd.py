@@ -243,7 +243,20 @@ def run_nemo_on_manifest(nemo_repo: str, manifest: str, out_dir: str,
         "diarizer.ignore_overlap=False",
     ]
     print("[NeMo] Running MSDD diarization on shards …")
-    subprocess.run(cmd, check=True)
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        print("[phase1] spectral/cuda failed → retrying on CPU + AHC")
+        # 1) device=cpu
+        cmd_cpu = [("device=cpu" if x == "device=cuda" else x) for x in cmd]
+        try:
+            subprocess.run(cmd_cpu, check=True)
+        except subprocess.CalledProcessError:
+            # 2) also force AHC if CPU spectral still fails
+            cmd_ahc = cmd_cpu + ["diarizer.clustering.parameters.clustering_method=ahc"]
+            subprocess.run(cmd_ahc, check=True)
+
 
 def gather_rttms(out_dir: str) -> List[str]:
     pred = os.path.join(out_dir, "pred_rttms")

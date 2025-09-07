@@ -41,7 +41,7 @@ def detect_silences(infile, noise_db, min_silence):
     # If stream ends inside a silence, close it at duration end if we can
     return silences
 
-def choose_cut_points(total, silences, min_len, target_len, max_len):
+def choose_cut_points(total, silences, min_len, target_len, max_len, min_seg):
     """
     Build a list of absolute cut boundaries (including 0 and total).
     We cut at the *start* of a silence closest to target_len for each chunk,
@@ -66,7 +66,8 @@ def choose_cut_points(total, silences, min_len, target_len, max_len):
         else:
             # no silence in the window → hard cut at window_max
             cut = window_max
-        if cut <= cur or cut - cuts[-1] < 1.0:  # sanity: enforce forward progress and >=1s
+        # sanity: enforce forward progress and >= min_seg seconds
+        if cut <= cur or (cut - cuts[-1]) < min_seg:
             cut = min(window_max, total)
         cuts.append(cut)
         cur = cut
@@ -74,11 +75,15 @@ def choose_cut_points(total, silences, min_len, target_len, max_len):
             break
     if cuts[-1] < total:
         cuts.append(total)
-    # dedup/monotonic
+    # Dedup/monotonic & enforce per-segment >= min_seg
     out = [cuts[0]]
     for t in cuts[1:]:
-        if t - out[-1] >= 0.5:
+        if (t - out[-1]) >= min_seg:
             out.append(t)
+    # Ensure trailing remainder is not shorter than min_seg:
+    # If last segment < min_seg, merge it into the previous one by dropping the penultimate boundary.
+    while len(out) >= 3 and (out[-1] - out[-2]) < min_seg:
+        out.pop(-2)
     return out
 
 def segment_once(infile, outdir, base, boundaries, codec_copy=True, force_wav=False, samplerate=None, channels=None):
@@ -141,6 +146,7 @@ def main():
     ap.add_argument("--min_len", type=float, default=600.0, help="Minimum chunk length in seconds (default 600 = 10 min)")
     ap.add_argument("--target_len", type=float, default=660.0, help="Target chunk length in seconds (default 660 = 11 min)")
     ap.add_argument("--max_len", type=float, default=720.0, help="Maximum chunk length in seconds (default 720 = 12 min)")
+    ap.add_argument("--min_seg", type=float, default=2.0, help="Minimum allowed segment length in seconds (final guard)")
     ap.add_argument("--noise_db", type=float, default=-30.0, help="Silence threshold in dBFS (default -30)")
     ap.add_argument("--min_silence", type=float, default=0.8, help="Minimum silence duration to consider (seconds)")
     ap.add_argument("--dry_run", action="store_true", help="Only print planned cuts, don’t write files")
@@ -153,7 +159,7 @@ def main():
     base = infile.stem
     total = ffprobe_duration(infile)
     silences = detect_silences(infile, args.noise_db, args.min_silence)
-    boundaries = choose_cut_points(total, silences, args.min_len, args.target_len, args.max_len)
+    boundaries = choose_cut_points(total, silences, args.min_len, args.target_len, args.max_len, args.min_seg)
 
     plan = {
         "input": str(infile),
