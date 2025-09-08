@@ -166,9 +166,34 @@ def _normalize_words(raw) -> Optional[List[Dict[str, Any]]]:
 
 class NemoASR:
     def __init__(self, model_name_or_path: str, device: str = "cuda", greedy: bool = True):
+
         self.device = device
-        # load
-        self.model: ASRModel = ASRModel.from_pretrained(model_name=model_name_or_path)
+        # If user asked for CUDA but it's clearly unavailable, fall back before load
+        try:
+            import torch
+            if self.device == "cuda" and not torch.cuda.is_available():
+                print("[ASR] CUDA not available; falling back to CPU.", file=sys.stderr)
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+                self.device = "cpu"
+        except Exception:
+            pass
+
+        # Load with fallback (Phase-1 style: retry on CPU if first attempt fails)
+        try:
+            self.model: ASRModel = ASRModel.from_pretrained(model_name=model_name_or_path)
+        except Exception as e:
+            msg = str(e)
+            if self.device == "cuda" and (
+                "CUDA driver initialization failed" in msg
+                or "abstract class ASRModel" in msg
+            ):
+                print("[ASR] CUDA init failed during load → retrying on CPU.", file=sys.stderr)
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+                self.device = "cpu"
+                self.model = ASRModel.from_pretrained(model_name=model_name_or_path)
+            else:
+                raise
+
         self.model.freeze()
         self.model.to(self._torch_device())
 
