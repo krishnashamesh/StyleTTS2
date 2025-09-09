@@ -1,4 +1,4 @@
-log_dir: "Models/Custom_Data/Sep_merged"
+log_dir: "Models/Custom_Data/Custom_Data_Eng_1"
 first_stage_path: "../first_stage.pth"
 second_stage_path: "../second_stage.pth"
 save_freq: 1
@@ -37,11 +37,11 @@ precision:
   tf32: false                # allow TF32 for matmuls when in fp32 mode
 
 data_params:
-  train_data: "/opt/apps/Training/Sep_merged/manifests_ipa/train_list.txt"
-  val_data: "/opt/apps/Training/Sep_merged/manifests_ipa/val_list.txt"
-  root_path: "/opt/apps/Training/Sep_merged/cuts"
-  OOD_data: "/opt/apps/Training/Sep_merged/manifests_ipa/OOD_texts.txt"
-  mel_cache_dir: "/opt/apps/Training/Sep_merged/mel_cache"
+  train_data: "/opt/apps/Training/Custom_Data_Eng_1/manifests_ipa/train_list.txt"
+  val_data: "/opt/apps/Training/Custom_Data_Eng_1/manifests_ipa/val_list.txt"
+  root_path: "/opt/apps/Training/Custom_Data_Eng_1/cuts"
+  OOD_data: "/opt/apps/Training/Custom_Data_Eng_1/manifests_ipa/OOD_texts.txt"
+  mel_cache_dir: "/opt/apps/Training/Custom_Data_Eng_1/mel_cache"
   min_length: 10 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:
